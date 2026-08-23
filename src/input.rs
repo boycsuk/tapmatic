@@ -699,7 +699,9 @@ pub fn execute_action_to_process(
                 use crate::macro_def::ScrollDirection;
                 send_mouse_scroll(*dir == ScrollDirection::Up, *clicks);
             }
-            KeyAction::MouseMove(x, y) => send_mouse_move(*x, *y),
+            KeyAction::MouseMove(x, y) => {
+                send_mouse_move(*x, *y);
+            }
             KeyAction::WaitForWindow(_) => {} // handled by executor
             KeyAction::TypeText(text) => {
                 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR};
