@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::macro_def::Macro;
+use crate::macro_def::{Macro, MAX_MACROS};
 
 const FILE_NAME: &str = ".tapmatic.json";
 
@@ -92,6 +92,7 @@ pub fn load() -> LoadOutcome {
     };
     match serde_json::from_str::<AppConfig>(&data) {
         Ok(mut config) => {
+            config.macros.truncate(MAX_MACROS);
             for mac in &mut config.macros {
                 mac.clamp_to_valid_ranges();
             }
@@ -115,6 +116,7 @@ fn migrate_old_format() -> AppConfig {
         if candidate.exists()
             && let Ok(data) = fs::read_to_string(&candidate)
                 && let Ok(mut macros) = serde_json::from_str::<Vec<Macro>>(&data) {
+                    macros.truncate(MAX_MACROS);
                     for mac in &mut macros {
                         mac.clamp_to_valid_ranges();
                     }

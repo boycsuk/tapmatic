@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Loading a config whose macro name or `TypeText` fell on a multibyte char
+  boundary panicked at every startup: the clamp used byte-index
+  `String::truncate`. The app itself could write such a name, since the input
+  path caps nothing. Truncation now backs up to a char boundary.
+- The load-time clamp missed several fields: `MouseScroll` clicks (i32
+  overflow when scaled by `WHEEL_DELTA`), `MouseMove` coordinates (overflow
+  when jittered), `WaitForWindow`, `bound_process`, `exclusive_group` and
+  `chain_macro` strings, and the macro count itself.
+
 - Deleting a macro while a search filter was active removed a different macro
   than the highlighted one, and the confirmation prompt named the wrong macro.
   `selected_macro` indexes the filtered list, but the delete path used it as a
