@@ -12,8 +12,6 @@ pub enum SortMode {
     Hotkey,
 }
 
-// ── Views ──
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum View {
     Main,
@@ -109,8 +107,6 @@ impl ConfigField {
     }
 }
 
-// ── Events between threads ──
-
 #[derive(Debug)]
 pub enum AppEvent {
     HotkeyPressed(i32),
@@ -134,8 +130,6 @@ pub enum ExecutorCommand {
     StopAll,
 }
 
-// ── Application state ──
-
 pub struct AppState {
     // Macro list
     pub macros: Vec<Macro>,
@@ -149,7 +143,9 @@ pub struct AppState {
 
     // Global toggle
     pub macros_enabled: bool,
-    /// Global speed multiplier (1.0 = normal, 0.5 = 2x fast, 2.0 = 2x slow)
+    /// Delay multiplier applied to every step: values above 1.0 slow playback
+    /// down, below 1.0 speed it up. The UI displays its reciprocal, so a stored
+    /// 0.25 is shown as "x4.00".
     pub speed_multiplier: f64,
 
     // Audio
@@ -158,10 +154,16 @@ pub struct AppState {
     // Foreground process (updated each frame)
     pub foreground_process: Option<String>,
 
+    /// Set when the config file could not be read at startup; blocks autosave
+    /// so a failed read is never overwritten by a save.
+    pub config_read_failed: bool,
+
+    /// Set by `autosave`, cleared once the event loop writes to disk.
+    pub unsaved_changes: bool,
+
     // Recording
     pub recording_steps: Vec<MacroStep>,
     pub recording_last_instant: Option<Instant>,
-    pub recording_start: Option<Instant>,
     pub recording_name: String,
     pub recording_pressed_keys: HashSet<u16>,
     pub recording_pressed_mouse: HashSet<MouseButton>,
@@ -214,7 +216,6 @@ pub struct AppState {
     pub undo_stack: Vec<Vec<Macro>>, // snapshots of macros list
 
     // Stats
-    pub macro_activations: std::collections::HashMap<i32, u32>, // vk -> activation count this session
 
     // Renaming
     pub renaming: bool,
@@ -255,9 +256,10 @@ impl AppState {
             speed_multiplier: 1.0,
             audio_enabled: true,
             foreground_process: None,
+            config_read_failed: false,
+            unsaved_changes: false,
             recording_steps: Vec::new(),
             recording_last_instant: None,
-            recording_start: None,
             recording_name: String::new(),
             recording_pressed_keys: HashSet::new(),
             recording_pressed_mouse: HashSet::new(),
@@ -291,7 +293,6 @@ impl AppState {
             selected_chain: 0,
             help_scroll: 0,
             undo_stack: Vec::new(),
-            macro_activations: std::collections::HashMap::new(),
             renaming: false,
             rename_buf: String::new(),
             text_cursor: 0,
@@ -322,11 +323,10 @@ impl AppState {
     }
 
     pub fn clear_stale_status(&mut self) {
-        if let Some((_, t, persistent)) = &self.status_message {
-            if !persistent && t.elapsed().as_secs() >= 3 {
+        if let Some((_, t, persistent)) = &self.status_message
+            && !persistent && t.elapsed().as_secs() >= 3 {
                 self.status_message = None;
             }
-        }
     }
 
     pub fn is_macro_active(&self, vk: i32) -> bool {
@@ -355,8 +355,12 @@ impl AppState {
         format!("Macro {}", self.macros.len() + 1)
     }
 
+    /// Move the selection cursor one row up or down, wrapping at the ends.
+    ///
+    /// Wraps against the visible (filtered) row count, since `selected_macro`
+    /// indexes the filtered list rather than `macros`.
     pub fn move_selection(&mut self, up: bool) {
-        let count = self.macros.len();
+        let count = self.filtered_macro_indices().len();
         if count == 0 {
             return;
         }
@@ -366,8 +370,6 @@ impl AppState {
             self.selected_macro = if self.selected_macro + 1 < count { self.selected_macro + 1 } else { 0 };
         }
     }
-
-    // ── Text buffer editing helpers ──
 
     /// Insert a character at the cursor position.
     pub fn buf_insert(&mut self, buf: &mut String, c: char) {
@@ -465,10 +467,13 @@ impl AppState {
         format!("{}|{}", left, right)
     }
 
+    /// Clamp the selection cursor into the visible (filtered) list.
+    ///
+    /// `selected_macro` indexes the filtered list, not `macros`, so the bound
+    /// is the number of visible rows.
     pub fn clamp_selection(&mut self) {
-        if self.selected_macro >= self.macros.len() && self.selected_macro > 0 {
-            self.selected_macro -= 1;
-        }
+        let visible = self.filtered_macro_indices().len();
+        self.selected_macro = self.selected_macro.min(visible.saturating_sub(1));
     }
 
     pub fn push_undo(&mut self) {
@@ -513,7 +518,7 @@ impl AppState {
     pub fn apply_sort(&mut self) {
         match self.sort_mode {
             SortMode::None => {}
-            SortMode::Name => self.macros.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            SortMode::Name => self.macros.sort_by_key(|a| a.name.to_lowercase()),
             SortMode::Hotkey => self.macros.sort_by_key(|m| m.hotkey_vk),
         }
         self.selected_macro = 0;
@@ -534,8 +539,6 @@ mod tests {
         }
         s
     }
-
-    // ── Navigation ──
 
     #[test]
     fn move_selection_wraps() {
@@ -568,18 +571,55 @@ mod tests {
         assert_eq!(s.selected_macro, 1);
     }
 
-    // ── Clamp selection ──
-
     #[test]
     fn clamp_selection_adjusts() {
         let mut s = state_with_macros(&["A", "B"]);
-        s.selected_macro = 5; // out of bounds
+        s.selected_macro = 5;
         s.clamp_selection();
-        assert_eq!(s.selected_macro, 4); // decrements by 1 (still out, but that's the contract)
+        assert_eq!(s.selected_macro, 1);
 
         s.selected_macro = 2;
         s.clamp_selection();
         assert_eq!(s.selected_macro, 1);
+    }
+
+    #[test]
+    fn filtered_selection_resolves_to_real_index() {
+        let mut s = state_with_macros(&["alpha", "beta", "gamma"]);
+        s.search_query = "gam".into();
+        s.selected_macro = 0; // first (and only) visible row
+
+        let filtered = s.filtered_macro_indices();
+        let real = filtered[s.selected_macro];
+        assert_eq!(real, 2, "display row 0 under this filter is macros[2]");
+        assert_eq!(s.macros[real].name, "gamma");
+    }
+
+    #[test]
+    fn clamp_selection_bounds_to_filtered_list() {
+        let mut s = state_with_macros(&["alpha", "beta", "gamma"]);
+        s.search_query = "a".into(); // matches alpha, beta, gamma
+        s.selected_macro = 2;
+        s.clamp_selection();
+        assert_eq!(s.selected_macro, 2);
+
+        s.search_query = "alph".into(); // matches alpha only
+        s.clamp_selection();
+        assert_eq!(s.selected_macro, 0);
+    }
+
+    #[test]
+    fn move_selection_wraps_within_filtered_list() {
+        let mut s = state_with_macros(&["alpha", "beta", "gamma"]);
+        s.search_query = "a".into();
+        s.selected_macro = 2;
+        s.move_selection(false);
+        assert_eq!(s.selected_macro, 0, "wraps at the end of the visible list");
+
+        s.search_query = "et".into(); // matches beta only
+        s.selected_macro = 0;
+        s.move_selection(false);
+        assert_eq!(s.selected_macro, 0, "single visible row stays put");
     }
 
     #[test]
@@ -589,8 +629,6 @@ mod tests {
         s.clamp_selection();
         assert_eq!(s.selected_macro, 1);
     }
-
-    // ── Macro active tracking ──
 
     #[test]
     fn macro_active_tracking() {
@@ -608,8 +646,6 @@ mod tests {
         assert!(s.active_macros.is_empty());
     }
 
-    // ── Macro by hotkey ──
-
     #[test]
     fn macro_by_hotkey_found() {
         let s = state_with_macros(&["Alpha", "Beta"]);
@@ -626,8 +662,6 @@ mod tests {
         assert!(s.macro_by_hotkey(0xFF).is_none());
     }
 
-    // ── Next macro name ──
-
     #[test]
     fn next_macro_name() {
         let s = AppState::new();
@@ -635,8 +669,6 @@ mod tests {
         let s = state_with_macros(&["A", "B", "C"]);
         assert_eq!(s.next_macro_name(), "Macro 4");
     }
-
-    // ── Search / filter ──
 
     #[test]
     fn filtered_macro_indices_no_query() {
@@ -658,8 +690,6 @@ mod tests {
         s.search_query = "zzz".into();
         assert!(s.filtered_macro_indices().is_empty());
     }
-
-    // ── Sort ──
 
     #[test]
     fn apply_sort_by_name() {
@@ -685,8 +715,6 @@ mod tests {
         assert_eq!(s.macros[0].hotkey_vk, 0x10);
         assert_eq!(s.macros[1].hotkey_vk, 0x50);
     }
-
-    // ── Undo ──
 
     #[test]
     fn undo_push_pop() {
@@ -715,8 +743,6 @@ mod tests {
         assert_eq!(s.undo_stack.len(), 20); // capped at 20
     }
 
-    // ── Step selection range ──
-
     #[test]
     fn step_selection_range_no_anchor() {
         let mut s = AppState::new();
@@ -735,8 +761,6 @@ mod tests {
         s.selection_anchor = Some(5);
         assert_eq!(s.step_selection_range(), (1, 5));
     }
-
-    // ── ConfigField helpers ──
 
     #[test]
     fn config_field_next_prev_in_tab() {
@@ -762,8 +786,6 @@ mod tests {
         assert!(!ConfigField::Name.is_numeric_field());
         assert!(!ConfigField::Hotkey.is_numeric_field());
     }
-
-    // ── Status messages ──
 
     #[test]
     fn status_message_lifecycle() {

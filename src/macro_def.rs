@@ -310,7 +310,55 @@ impl Macro {
     pub fn total_duration_ms(&self) -> u64 {
         self.steps.iter().map(|s| s.delay_ms).sum()
     }
+
+    /// Bring every field deserialized from disk into the range the rest of the
+    /// code assumes.
+    ///
+    /// The config file is the app's untrusted-input boundary: macro files are
+    /// shared between users, and nothing else between `serde_json` and the
+    /// executor enforces these bounds.
+    pub fn clamp_to_valid_ranges(&mut self) {
+        self.name.truncate(MAX_NAME_LEN);
+        self.steps.truncate(MAX_STEPS);
+
+        if !is_valid_vk(self.hotkey_vk) {
+            self.hotkey_vk = 0;
+        }
+        if !is_valid_vk(self.require_held_vk) {
+            self.require_held_vk = 0;
+        }
+
+        self.fixed_interval_ms = self.fixed_interval_ms.min(MAX_DELAY_MS);
+        self.cycle_delay_ms = self.cycle_delay_ms.min(MAX_DELAY_MS);
+        self.start_delay_ms = self.start_delay_ms.min(MAX_DELAY_MS);
+        self.humanize_ms = self.humanize_ms.min(MAX_DELAY_MS);
+        self.mouse_jitter = self.mouse_jitter.min(MAX_MOUSE_JITTER_PX);
+
+        if let Some((min, max)) = self.random_delay {
+            self.random_delay = Some((min.min(MAX_DELAY_MS), max.min(MAX_DELAY_MS)));
+        }
+
+        for step in &mut self.steps {
+            step.delay_ms = step.delay_ms.min(MAX_DELAY_MS);
+            if let KeyAction::TypeText(text) = &mut step.action {
+                text.truncate(MAX_TYPE_TEXT_LEN);
+            }
+        }
+    }
 }
+
+/// Virtual-key codes are a byte; 0 means "unbound".
+fn is_valid_vk(vk: i32) -> bool {
+    (1..=254).contains(&vk)
+}
+
+const MAX_NAME_LEN: usize = 128;
+const MAX_STEPS: usize = 100_000;
+const MAX_TYPE_TEXT_LEN: usize = 10_000;
+/// One hour: long enough for any real macro, short enough to stay in u64 range
+/// once multiplied by the humanize span.
+const MAX_DELAY_MS: u64 = 60 * 60 * 1000;
+const MAX_MOUSE_JITTER_PX: u32 = 1000;
 
 /// Convert a Windows virtual-key code to a human-readable name.
 pub fn vk_name(vk: i32) -> &'static str {
@@ -479,8 +527,6 @@ pub fn vk_name(vk: i32) -> &'static str {
 mod tests {
     use super::*;
 
-    // ── RepetitionMode ──
-
     #[test]
     fn repetition_mode_cycle() {
         assert_eq!(RepetitionMode::Toggle.next(), RepetitionMode::HoldToRepeat);
@@ -498,8 +544,6 @@ mod tests {
         assert_eq!(RepetitionMode::HoldToRepeat.label(), "Hold");
         assert_eq!(RepetitionMode::SingleShot.label(), "Single");
     }
-
-    // ── StopCondition ──
 
     #[test]
     fn stop_condition_display() {
@@ -522,8 +566,6 @@ mod tests {
         assert_eq!(StopCondition::None.with_value(100), StopCondition::None);
     }
 
-    // ── KeyAction::from_vk ──
-
     #[test]
     fn from_vk_mouse_buttons() {
         assert_eq!(KeyAction::from_vk(0x01, 0, true), Some(KeyAction::MouseDown(MouseButton::Left)));
@@ -543,8 +585,6 @@ mod tests {
         assert_eq!(KeyAction::from_vk(0xFF, 0, true), None);
         assert_eq!(KeyAction::from_vk(0x03, 0, false), None);
     }
-
-    // ── KeyAction::display_name ──
 
     #[test]
     fn display_name_keys() {
@@ -583,8 +623,6 @@ mod tests {
         assert_eq!(KeyAction::WaitForWindow("notepad.exe".into()).display_name(), "Wait: notepad.exe");
     }
 
-    // ── Macro ──
-
     #[test]
     fn macro_new_defaults() {
         let m = Macro::new("Test".into());
@@ -617,8 +655,6 @@ mod tests {
         assert_eq!(m.step_count(), 2);
         assert_eq!(m.total_duration_ms(), 150);
     }
-
-    // ── Serde round-trip ──
 
     #[test]
     fn serde_all_action_variants() {
@@ -680,7 +716,7 @@ mod tests {
 
     #[test]
     fn serde_backward_compat_missing_new_fields() {
-        // Simulates loading a macro saved BEFORE mouse_jitter, mouse_scroll, etc. existed
+        // Every #[serde(default)] field must fall back cleanly when absent.
         let old_json = r#"[{
             "name": "Old Macro",
             "steps": [{"action": {"KeyDown": 30}, "delay_ms": 50}],
@@ -707,8 +743,6 @@ mod tests {
         assert_eq!(m.steps.len(), 1);
     }
 
-    // ── vk_name ──
-
     #[test]
     fn vk_name_known_keys() {
         assert_eq!(vk_name(0x01), "LMB");
@@ -723,11 +757,94 @@ mod tests {
         assert_eq!(vk_name(0x07), "???");
     }
 
-    // ── SendMode ──
-
     #[test]
     fn send_mode_labels() {
         assert_eq!(SendMode::Global.label(), "Global");
         assert_eq!(SendMode::Window.label(), "Window");
+    }
+
+    #[test]
+    fn clamp_rejects_out_of_range_vk() {
+        let mut m = Macro::new("m".into());
+        m.hotkey_vk = 9999;
+        m.require_held_vk = -5;
+        m.clamp_to_valid_ranges();
+        assert_eq!(m.hotkey_vk, 0, "unbound rather than passed to GetAsyncKeyState");
+        assert_eq!(m.require_held_vk, 0);
+    }
+
+    #[test]
+    fn clamp_keeps_valid_vk() {
+        let mut m = Macro::new("m".into());
+        m.hotkey_vk = 65;
+        m.require_held_vk = 254;
+        m.clamp_to_valid_ranges();
+        assert_eq!(m.hotkey_vk, 65);
+        assert_eq!(m.require_held_vk, 254);
+    }
+
+    #[test]
+    fn clamp_bounds_the_random_delay_span() {
+        // The exact pair that made max - min + 1 wrap to zero and panic.
+        let mut m = Macro::new("m".into());
+        m.random_delay = Some((0, u64::MAX));
+        m.clamp_to_valid_ranges();
+
+        let (min, max) = m.random_delay.expect("range kept");
+        assert_eq!(min, 0);
+        assert!(max <= 60 * 60 * 1000);
+        assert!(max.checked_sub(min).and_then(|s| s.checked_add(1)).is_some());
+    }
+
+    #[test]
+    fn clamp_bounds_delays_and_jitter() {
+        let mut m = Macro::new("m".into());
+        m.humanize_ms = u64::MAX;
+        m.fixed_interval_ms = u64::MAX;
+        m.start_delay_ms = u64::MAX;
+        m.cycle_delay_ms = u64::MAX;
+        m.mouse_jitter = u32::MAX;
+        m.clamp_to_valid_ranges();
+
+        let max_ms = 60 * 60 * 1000;
+        assert_eq!(m.humanize_ms, max_ms);
+        assert_eq!(m.fixed_interval_ms, max_ms);
+        assert_eq!(m.start_delay_ms, max_ms);
+        assert_eq!(m.cycle_delay_ms, max_ms);
+        assert_eq!(m.mouse_jitter, 1000);
+    }
+
+    #[test]
+    fn clamp_truncates_unbounded_strings() {
+        let mut m = Macro::new("n".repeat(5000));
+        m.steps.push(MacroStep {
+            action: KeyAction::TypeText("x".repeat(50_000)),
+            delay_ms: u64::MAX,
+        });
+        m.clamp_to_valid_ranges();
+
+        assert_eq!(m.name.len(), 128);
+        assert_eq!(m.steps[0].delay_ms, 60 * 60 * 1000);
+        match &m.steps[0].action {
+            KeyAction::TypeText(t) => assert_eq!(t.len(), 10_000),
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clamp_leaves_a_normal_macro_untouched() {
+        let mut m = Macro::new("normal".into());
+        m.hotkey_vk = 65;
+        m.fixed_interval_ms = 50;
+        m.humanize_ms = 10;
+        m.random_delay = Some((10, 100));
+        let before = m.clone();
+        m.clamp_to_valid_ranges();
+
+        assert_eq!(m.name, before.name);
+        assert_eq!(m.hotkey_vk, before.hotkey_vk);
+        assert_eq!(m.fixed_interval_ms, before.fixed_interval_ms);
+        assert_eq!(m.humanize_ms, before.humanize_ms);
+        assert_eq!(m.random_delay, before.random_delay);
     }
 }

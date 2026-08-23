@@ -33,6 +33,28 @@ pub const MAIN_BUTTONS: &[&str] = &[
     "Record", "Edit", "Copy", "Delete", "Save", "Toggle", "Mute", "Quit",
 ];
 
+/// Indices into [`MAIN_BUTTONS`], used by the toolbar dispatch.
+const BTN_RECORD: usize = 0;
+const BTN_EDIT: usize = 1;
+const BTN_COPY: usize = 2;
+const BTN_DELETE: usize = 3;
+const BTN_SAVE: usize = 4;
+const BTN_TOGGLE: usize = 5;
+const BTN_MUTE: usize = 6;
+const BTN_QUIT: usize = 7;
+
+/// How long a config change may sit in memory before being written to disk.
+const SAVE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Poll the foreground window every N frames (~4x/second at 60fps).
+const FOREGROUND_POLL_FRAMES: u32 = 15;
+
+/// Delay multiplier bounds. Values below 1.0 speed playback up, above slow it
+/// down; the UI presents the reciprocal.
+const MIN_SPEED_MULTIPLIER: f64 = 0.25;
+const MAX_SPEED_MULTIPLIER: f64 = 4.0;
+const SPEED_MULTIPLIER_STEP: f64 = 0.25;
+
 fn main() {
     // Panic handler: restore terminal before printing panic info
     let default_hook = std::panic::take_hook();
@@ -43,7 +65,10 @@ fn main() {
 
     input::begin_high_res_timer();
 
-    let config = persistence::load();
+    let (config, load_error) = match persistence::load() {
+        persistence::LoadOutcome::Loaded(c) | persistence::LoadOutcome::Fresh(c) => (c, None),
+        persistence::LoadOutcome::Corrupt(reason) => (persistence::AppConfig::default(), Some(reason)),
+    };
 
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
     let (cmd_tx, cmd_rx) = mpsc::channel::<ExecutorCommand>();
@@ -54,7 +79,11 @@ fn main() {
     state.macros = config.macros;
     state.audio_enabled = config.audio_enabled;
     state.macros_enabled = config.macros_enabled;
-    state.speed_multiplier = config.speed_multiplier;
+    state.speed_multiplier = config.speed_multiplier.clamp(MIN_SPEED_MULTIPLIER, MAX_SPEED_MULTIPLIER);
+    if let Some(reason) = load_error {
+        state.config_read_failed = true;
+        state.set_status_persistent(format!("Config not loaded ({reason}). Saving is disabled."));
+    }
     AUDIO_ENABLED.store(state.audio_enabled, Ordering::SeqCst);
     MACROS_ENABLED.store(state.macros_enabled, Ordering::SeqCst);
     SPEED_MULTIPLIER.store(state.speed_multiplier.to_bits(), Ordering::SeqCst);
@@ -81,6 +110,9 @@ fn main() {
     let result = run_app(&mut terminal, &mut state, &event_rx, &cmd_tx, &hotkey_config);
     ratatui::restore();
 
+    // run_app flushes on a clean quit; this covers the error path.
+    flush_pending_save(&mut state);
+
     RUNNING.store(false, Ordering::SeqCst);
     let _ = cmd_tx.send(ExecutorCommand::StopAll);
     input::end_high_res_timer();
@@ -100,13 +132,23 @@ fn run_app(
     let mut frame_count: u32 = 0;
     let mut cpu_snapshot = input::get_cpu_usage_snapshot();
     let app_start = std::time::Instant::now();
+    let mut last_save = std::time::Instant::now();
 
     loop {
-        state.foreground_process = input::get_foreground_process_name();
+        // The foreground window changes at human speed; polling it every frame
+        // costs four syscalls and a handle open/close for nothing.
+        if frame_count.is_multiple_of(FOREGROUND_POLL_FRAMES) {
+            state.foreground_process = input::get_foreground_process_name();
+        }
+
+        if state.unsaved_changes && last_save.elapsed() >= SAVE_INTERVAL {
+            flush_pending_save(state);
+            last_save = std::time::Instant::now();
+        }
 
         // Update system stats every ~1 second (60 frames)
         frame_count += 1;
-        if frame_count % 60 == 0 {
+        if frame_count.is_multiple_of(60) {
             let new_snapshot = input::get_cpu_usage_snapshot();
             state.cpu_usage = input::calc_cpu_percent(cpu_snapshot, new_snapshot);
             cpu_snapshot = new_snapshot;
@@ -134,6 +176,7 @@ fn run_app(
         terminal.draw(|f| ui::draw(f, state))?;
 
         if state.should_quit {
+            flush_pending_save(state);
             return Ok(());
         }
 
@@ -143,13 +186,11 @@ fn run_app(
             handle_app_event(state, ev, cmd_tx, hotkey_config);
         }
 
-        if event::poll(Duration::from_millis(16))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+        if event::poll(Duration::from_millis(16))?
+            && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press {
                     handle_key(state, key.code, key.modifiers, cmd_tx, hotkey_config);
                 }
-            }
-        }
     }
 }
 
@@ -201,7 +242,6 @@ fn start_macro(
     enforce_exclusive_group(state, &mac, cmd_tx);
     let _ = cmd_tx.send(ExecutorCommand::StartMacro(mac));
     state.set_macro_active(vk, true);
-    *state.macro_activations.entry(vk).or_insert(0) += 1;
     audio::play_activate();
 }
 
@@ -234,17 +274,16 @@ fn handle_app_event(
             }
         }
         AppEvent::HotkeyReleased(vk) => {
-            if let Some((_, mac)) = state.macro_by_hotkey(vk) {
-                if mac.repetition == RepetitionMode::HoldToRepeat && state.is_macro_active(vk) {
+            if let Some((_, mac)) = state.macro_by_hotkey(vk)
+                && mac.repetition == RepetitionMode::HoldToRepeat && state.is_macro_active(vk) {
                     let _ = cmd_tx.send(ExecutorCommand::StopMacro(vk));
                     state.set_macro_active(vk, false);
                     audio::play_deactivate();
                 }
-            }
         }
         AppEvent::HotkeyCaptured(vk) => {
-            if state.awaiting_hotkey || state.awaiting_require_held {
-                if let View::Config(idx) = state.view {
+            if (state.awaiting_hotkey || state.awaiting_require_held)
+                && let View::Config(idx) = state.view {
                     // Check for duplicate hotkey before mutable borrow
                     let dupe_name = if state.awaiting_hotkey {
                         state.macros.iter().enumerate()
@@ -270,9 +309,8 @@ fn handle_app_event(
                         state.set_status(label);
                     }
                 }
-            }
-            if state.editing_step_action {
-                if let View::StepEditor(idx) = state.view {
+            if state.editing_step_action
+                && let View::StepEditor(idx) = state.view {
                     let sc = input::vk_to_scancode(vk);
                     if let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
                         let is_down = matches!(
@@ -288,9 +326,8 @@ fn handle_app_event(
                     state.editing_step_action = false;
                     AWAITING_HOTKEY.store(false, Ordering::SeqCst);
                 }
-            }
-            if state.inserting_key_step {
-                if let View::StepEditor(idx) = state.view {
+            if state.inserting_key_step
+                && let View::StepEditor(idx) = state.view {
                     let sc = input::vk_to_scancode(vk);
                     if let (Some(action_down), Some(action_up)) = (
                         KeyAction::from_vk(vk, sc, true),
@@ -306,7 +343,6 @@ fn handle_app_event(
                     state.inserting_key_step = false;
                     AWAITING_HOTKEY.store(false, Ordering::SeqCst);
                 }
-            }
         }
         AppEvent::MacroProgress(vk, reps, secs) => {
             state.macro_progress.insert(vk, (reps, secs));
@@ -446,7 +482,6 @@ fn handle_key(
     }
 }
 
-// ── Main View ──
 // Up/Down = navigate macro list, Left/Right = navigate buttons, Enter = activate button
 
 fn activate_button(
@@ -455,21 +490,18 @@ fn activate_button(
     hotkey_config: &Arc<Mutex<HotkeyConfig>>,
 ) {
     match state.selected_button {
-        0 => {
-            // Record
+        BTN_RECORD => {
             recorder::start_recording(state);
             update_hotkey_config(state, hotkey_config);
         }
-        1 => {
-            // Edit
+        BTN_EDIT => {
             if let Some(real_idx) = resolve_selected_macro(state) {
                 enter_config(state, real_idx);
             } else {
                 state.set_status("No macros to edit. Record one first");
             }
         }
-        2 => {
-            // Copy
+        BTN_COPY => {
             if let Some(real_idx) = resolve_selected_macro(state) {
                 let src_name = state.macros[real_idx].name.clone();
                 let mut copy = state.macros[real_idx].clone();
@@ -485,23 +517,20 @@ fn activate_button(
                 state.set_status("No macros to copy. Record one first");
             }
         }
-        3 => {
-            // Delete
-            if !state.macros.is_empty() {
+        BTN_DELETE => {
+            if let Some(real_idx) = resolve_selected_macro(state) {
                 state.confirm_delete = true;
-                let name = &state.macros[state.selected_macro].name;
+                let name = &state.macros[real_idx].name;
                 state.set_status_persistent(format!("Delete '{}'? Enter=yes  Esc=no", name));
             } else {
                 state.set_status("No macros to delete");
             }
         }
-        4 => {
-            // Save to file
+        BTN_SAVE => {
             autosave(state);
             state.set_status(format!("Saved {} macros to .tapmatic.json", state.macros.len()));
         }
-        5 => {
-            // Toggle
+        BTN_TOGGLE => {
             state.macros_enabled = !state.macros_enabled;
             MACROS_ENABLED.store(state.macros_enabled, Ordering::SeqCst);
             if !state.macros_enabled {
@@ -516,8 +545,7 @@ fn activate_button(
             }
             autosave(state);
         }
-        6 => {
-            // Mute
+        BTN_MUTE => {
             state.audio_enabled = !state.audio_enabled;
             AUDIO_ENABLED.store(state.audio_enabled, Ordering::SeqCst);
             if state.audio_enabled {
@@ -527,8 +555,7 @@ fn activate_button(
             }
             autosave(state);
         }
-        7 => {
-            // Quit
+        BTN_QUIT => {
             request_quit(state);
         }
         _ => {}
@@ -559,35 +586,26 @@ fn handle_key_main(
     cmd_tx: &mpsc::Sender<ExecutorCommand>,
     hotkey_config: &Arc<Mutex<HotkeyConfig>>,
 ) {
-    // Renaming mode
     if state.renaming {
-        match key {
-            KeyCode::Enter => {
-                if let Some(real_idx) = resolve_selected_macro(state) {
-                    if !state.rename_buf.is_empty() {
-                        state.macros[real_idx].name = state.rename_buf.clone();
-                        state.set_status(format!("Renamed to '{}'", state.rename_buf));
+        match handle_modal_input(state, TextField::Rename, key, mods) {
+            ModalOutcome::Committed(name) => {
+                if let Some(real_idx) = resolve_selected_macro(state)
+                    && !name.is_empty() {
+                        state.macros[real_idx].name = name.clone();
+                        state.set_status(format!("Renamed to '{}'", name));
                         autosave(state);
                     }
-                }
                 state.renaming = false;
-                state.rename_buf.clear();
             }
-            KeyCode::Esc => {
+            ModalOutcome::Cancelled => {
                 state.renaming = false;
-                state.rename_buf.clear();
                 state.set_status("Rename cancelled");
             }
-            _ => {
-                let mut buf = state.rename_buf.clone();
-                handle_text_motion(state, &mut buf, key, mods, true, true);
-                state.rename_buf = buf;
-            }
+            ModalOutcome::Editing => {}
         }
         return;
     }
 
-    // Search mode
     if state.searching {
         match key {
             KeyCode::Enter | KeyCode::Esc => {
@@ -610,15 +628,15 @@ fn handle_key_main(
     if state.confirm_delete {
         match key {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if state.selected_macro < state.macros.len() {
+                if let Some(real_idx) = resolve_selected_macro(state) {
                     state.push_undo();
-                    let name = state.macros[state.selected_macro].name.clone();
-                    let vk = state.macros[state.selected_macro].hotkey_vk;
+                    let name = state.macros[real_idx].name.clone();
+                    let vk = state.macros[real_idx].hotkey_vk;
                     if state.is_macro_active(vk) {
                         let _ = cmd_tx.send(ExecutorCommand::StopMacro(vk));
                         state.set_macro_active(vk, false);
                     }
-                    state.macros.remove(state.selected_macro);
+                    state.macros.remove(real_idx);
                     state.clamp_selection();
                     state.set_status(format!("Deleted '{}'", name));
                     update_hotkey_config(state, hotkey_config);
@@ -694,19 +712,18 @@ fn handle_key_main(
         }
         KeyCode::Char('k') | KeyCode::Char('K') => {
             // Move macro up
-            if let Some(real_idx) = resolve_selected_macro(state) {
-                if real_idx > 0 {
+            if let Some(real_idx) = resolve_selected_macro(state)
+                && real_idx > 0 {
                     state.push_undo();
                     state.macros.swap(real_idx, real_idx - 1);
                     state.selected_macro = state.selected_macro.saturating_sub(1);
                     autosave(state);
                 }
-            }
         }
         KeyCode::Char('j') | KeyCode::Char('J') => {
             // Move macro down
-            if let Some(real_idx) = resolve_selected_macro(state) {
-                if real_idx + 1 < state.macros.len() {
+            if let Some(real_idx) = resolve_selected_macro(state)
+                && real_idx + 1 < state.macros.len() {
                     state.push_undo();
                     state.macros.swap(real_idx, real_idx + 1);
                     if state.selected_macro + 1 < state.filtered_macro_indices().len() {
@@ -714,7 +731,6 @@ fn handle_key_main(
                     }
                     autosave(state);
                 }
-            }
         }
         KeyCode::Char('/') => {
             // Search
@@ -724,13 +740,14 @@ fn handle_key_main(
             state.set_status_persistent("Type to search...");
         }
         KeyCode::F(3) => {
-            // Cycle sort mode
             state.sort_mode = match state.sort_mode {
                 state::SortMode::None => state::SortMode::Name,
                 state::SortMode::Name => state::SortMode::Hotkey,
                 state::SortMode::Hotkey => state::SortMode::None,
             };
+            state.push_undo();
             state.apply_sort();
+            autosave(state);
             let label = match state.sort_mode {
                 state::SortMode::None => "No sort",
                 state::SortMode::Name => "Sorted by name",
@@ -741,8 +758,8 @@ fn handle_key_main(
         }
         KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('-') | KeyCode::Char('0') => {
             state.speed_multiplier = match key {
-                KeyCode::Char('+') | KeyCode::Char('=') => (state.speed_multiplier + 0.25).min(4.0),
-                KeyCode::Char('-') => (state.speed_multiplier - 0.25).max(0.25),
+                KeyCode::Char('+') | KeyCode::Char('=') => (state.speed_multiplier + SPEED_MULTIPLIER_STEP).min(MAX_SPEED_MULTIPLIER),
+                KeyCode::Char('-') => (state.speed_multiplier - SPEED_MULTIPLIER_STEP).max(MIN_SPEED_MULTIPLIER),
                 _ => 1.0,
             };
             SPEED_MULTIPLIER.store(state.speed_multiplier.to_bits(), Ordering::SeqCst);
@@ -772,8 +789,6 @@ fn handle_key_main(
     }
 }
 
-// ── Recording View ──
-
 fn handle_key_recording(
     _state: &mut AppState,
     _key: KeyCode,
@@ -782,8 +797,6 @@ fn handle_key_recording(
     // All recording controls (Esc, F1, F2, F3, Alt+Z) are handled via AppEvent
     // from the hotkey thread so they work without TUI focus.
 }
-
-// ── Config View ──
 
 fn save_config(state: &mut AppState, idx: usize, hotkey_config: &Arc<Mutex<HotkeyConfig>>) {
     apply_config_field(state, idx);
@@ -825,14 +838,40 @@ fn request_quit(state: &mut AppState) {
     }
 }
 
-fn autosave(state: &AppState) {
+/// Persist the current state, reporting any failure in the status bar.
+///
+/// Does nothing when the config on disk could not be parsed at startup, so a
+/// save never overwrites a file we failed to read.
+/// Mark the config dirty so the event loop flushes it shortly.
+///
+/// Called from every mutating key handler, so it must not touch the disk: the
+/// write happens in `flush_pending_save`, at most once per `SAVE_INTERVAL`.
+fn autosave(state: &mut AppState) {
+    if state.config_read_failed {
+        state.set_status_persistent("Not saving: config file unreadable at startup");
+        return;
+    }
+    state.unsaved_changes = true;
+}
+
+/// Write the config if it is dirty, reporting failures in the status bar.
+fn flush_pending_save(state: &mut AppState) {
+    if !state.unsaved_changes || state.config_read_failed {
+        return;
+    }
     let config = persistence::AppConfig {
         audio_enabled: state.audio_enabled,
         macros_enabled: state.macros_enabled,
         speed_multiplier: state.speed_multiplier,
         macros: state.macros.clone(),
     };
-    let _ = persistence::save(&config);
+    match persistence::save(&config) {
+        Ok(()) => state.unsaved_changes = false,
+        Err(e) => {
+            state.unsaved_changes = false;
+            state.set_status_persistent(format!("Save failed: {e}"));
+        }
+    }
 }
 
 fn handle_key_config(
@@ -1004,17 +1043,15 @@ fn handle_key_config(
 
 fn apply_config_field(state: &mut AppState, idx: usize) {
     match state.config_field {
-        ConfigField::Name => {
-            if !state.config_input_buf.is_empty() {
+        ConfigField::Name
+            if !state.config_input_buf.is_empty() => {
                 state.macros[idx].name = state.config_input_buf.clone();
             }
-        }
         ConfigField::FixedInterval => {
-            if let Ok(ms) = state.config_input_buf.parse::<u64>() {
-                if ms > 0 {
+            if let Ok(ms) = state.config_input_buf.parse::<u64>()
+                && ms > 0 {
                     state.macros[idx].fixed_interval_ms = ms;
                 }
-            }
         }
         ConfigField::RandomDelayMin => {
             if let Ok(ms) = state.config_input_buf.parse::<u64>() {
@@ -1031,11 +1068,10 @@ fn apply_config_field(state: &mut AppState, idx: usize) {
             }
         }
         ConfigField::StopValue => {
-            if let Ok(val) = state.config_input_buf.parse::<u32>() {
-                if val > 0 {
+            if let Ok(val) = state.config_input_buf.parse::<u32>()
+                && val > 0 {
                     state.macros[idx].stop_condition = state.macros[idx].stop_condition.with_value(val);
                 }
-            }
         }
         ConfigField::CycleDelay => {
             if let Ok(ms) = state.config_input_buf.parse::<u64>() {
@@ -1127,16 +1163,88 @@ fn prefill_config_buf(state: &mut AppState, idx: usize) {
     state.text_cursor = state.config_input_buf.chars().count();
 }
 
-// ── Step Editor ──
+/// What a modal text input did with a key press.
+enum ModalOutcome {
+    /// Enter: the buffer is ready to be applied by the caller.
+    Committed(String),
+    Cancelled,
+    /// The key was consumed as editing input.
+    Editing,
+}
 
-fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers) {
-    let idx = match state.view {
-        View::StepEditor(i) => i,
-        _ => return,
-    };
+/// Which buffer on `AppState` a modal input is editing.
+#[derive(Clone, Copy)]
+enum TextField {
+    InsertText,
+    ScrollClicks,
+    StepDelay,
+    Rename,
+}
 
-    let step_count = state.macros[idx].steps.len();
+impl TextField {
+    fn get(self, state: &AppState) -> &String {
+        match self {
+            Self::InsertText => &state.insert_text_buf,
+            Self::ScrollClicks => &state.scroll_clicks_buf,
+            Self::StepDelay => &state.step_delay_buf,
+            Self::Rename => &state.rename_buf,
+        }
+    }
 
+    fn set(self, state: &mut AppState, value: String) {
+        match self {
+            Self::InsertText => state.insert_text_buf = value,
+            Self::ScrollClicks => state.scroll_clicks_buf = value,
+            Self::StepDelay => state.step_delay_buf = value,
+            Self::Rename => state.rename_buf = value,
+        }
+    }
+
+    /// Numeric fields reject letters; text fields accept both.
+    fn allows_text(self) -> bool {
+        matches!(self, Self::InsertText | Self::Rename)
+    }
+}
+
+/// Drive one key press through a modal text buffer.
+///
+/// Returns the buffer on Enter and clears it on either Enter or Esc, so callers
+/// only decide what a committed value means.
+fn handle_modal_input(
+    state: &mut AppState,
+    field: TextField,
+    key: KeyCode,
+    mods: KeyModifiers,
+) -> ModalOutcome {
+    match key {
+        KeyCode::Enter => {
+            let value = field.get(state).clone();
+            field.set(state, String::new());
+            ModalOutcome::Committed(value)
+        }
+        KeyCode::Esc => {
+            field.set(state, String::new());
+            ModalOutcome::Cancelled
+        }
+        _ => {
+            let mut buf = field.get(state).clone();
+            handle_text_motion(state, &mut buf, key, mods, field.allows_text(), true);
+            field.set(state, buf);
+            ModalOutcome::Editing
+        }
+    }
+}
+
+/// Handle the modal input layers of the step editor.
+///
+/// Returns true when the key was consumed by a modal, so the command match is
+/// skipped.
+fn handle_step_editor_modal(
+    state: &mut AppState,
+    idx: usize,
+    key: KeyCode,
+    mods: KeyModifiers,
+) -> bool {
     // Awaiting key capture (insert or replace) — only Esc cancels
     if state.inserting_key_step || state.editing_step_action {
         if key == KeyCode::Esc {
@@ -1146,92 +1254,85 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             AWAITING_HOTKEY.store(false, Ordering::SeqCst);
             state.set_status(msg);
         }
-        return;
+        return true;
     }
 
-    // Inserting a TypeText step
     if state.inserting_text {
-        match key {
-            KeyCode::Enter => {
-                if !state.insert_text_buf.is_empty() {
-                    let text = state.insert_text_buf.clone();
+        match handle_modal_input(state, TextField::InsertText, key, mods) {
+            ModalOutcome::Committed(text) => {
+                if !text.is_empty() {
                     let step = MacroStep {
                         action: KeyAction::TypeText(text.clone()),
                         delay_ms: 0,
                     };
-                    // Insert after current selection
-                    let insert_pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
-                    state.macros[idx].steps.insert(insert_pos, step);
-                    state.selected_step = insert_pos;
+                    let pos = insert_step_after_selection(state, idx, step);
+                    state.selected_step = pos;
                     state.set_status(format!("Inserted text: \"{}\"", text));
                 }
                 state.inserting_text = false;
-                state.insert_text_buf.clear();
             }
-            KeyCode::Esc => {
+            ModalOutcome::Cancelled => {
                 state.inserting_text = false;
-                state.insert_text_buf.clear();
                 state.set_status("Insert cancelled");
             }
-            _ => {
-                let mut buf = state.insert_text_buf.clone();
-                handle_text_motion(state, &mut buf, key, mods, true, true);
-                state.insert_text_buf = buf;
-            }
+            ModalOutcome::Editing => {}
         }
-        return;
+        return true;
     }
 
     if state.editing_scroll_clicks {
-        match key {
-            KeyCode::Enter => {
-                if let Ok(clicks) = state.scroll_clicks_buf.parse::<u32>() {
-                    if clicks > 0 {
-                        if let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
-                            if let KeyAction::MouseScroll(dir, ref mut c) = step.action {
+        match handle_modal_input(state, TextField::ScrollClicks, key, mods) {
+            ModalOutcome::Committed(buf) => {
+                if let Ok(clicks) = buf.parse::<u32>()
+                    && clicks > 0
+                        && let Some(step) = state.macros[idx].steps.get_mut(state.selected_step)
+                            && let KeyAction::MouseScroll(dir, ref mut c) = step.action {
                                 *c = clicks;
-                                state.set_status(format!("Scroll {} x{}", if dir == ScrollDirection::Up { "up" } else { "down" }, clicks));
+                                let label = if dir == ScrollDirection::Up { "up" } else { "down" };
+                                state.set_status(format!("Scroll {} x{}", label, clicks));
                             }
-                        }
-                    }
-                }
                 state.editing_scroll_clicks = false;
-                state.scroll_clicks_buf.clear();
             }
-            KeyCode::Esc => {
-                state.editing_scroll_clicks = false;
-                state.scroll_clicks_buf.clear();
-            }
-            _ => {
-                let mut buf = state.scroll_clicks_buf.clone();
-                handle_text_motion(state, &mut buf, key, mods, false, true);
-                state.scroll_clicks_buf = buf;
-            }
+            ModalOutcome::Cancelled => state.editing_scroll_clicks = false,
+            ModalOutcome::Editing => {}
         }
-        return;
+        return true;
     }
 
     if state.editing_step_delay {
-        match key {
-            KeyCode::Enter => {
-                if let Ok(ms) = state.step_delay_buf.parse::<u64>() {
-                    if let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
+        match handle_modal_input(state, TextField::StepDelay, key, mods) {
+            ModalOutcome::Committed(buf) => {
+                if let Ok(ms) = buf.parse::<u64>()
+                    && let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
                         step.delay_ms = ms;
                     }
-                }
                 state.editing_step_delay = false;
-                state.step_delay_buf.clear();
             }
-            KeyCode::Esc => {
-                state.editing_step_delay = false;
-                state.step_delay_buf.clear();
-            }
-            _ => {
-                let mut buf = state.step_delay_buf.clone();
-                handle_text_motion(state, &mut buf, key, mods, false, true);
-                state.step_delay_buf = buf;
-            }
+            ModalOutcome::Cancelled => state.editing_step_delay = false,
+            ModalOutcome::Editing => {}
         }
+        return true;
+    }
+
+    false
+}
+
+/// Insert a step directly after the current selection, returning its position.
+fn insert_step_after_selection(state: &mut AppState, idx: usize, step: MacroStep) -> usize {
+    let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
+    state.macros[idx].steps.insert(pos, step);
+    pos
+}
+
+fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers) {
+    let idx = match state.view {
+        View::StepEditor(i) => i,
+        _ => return,
+    };
+
+    let step_count = state.macros[idx].steps.len();
+
+    if handle_step_editor_modal(state, idx, key, mods) {
         return;
     }
 
@@ -1241,8 +1342,8 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
         }
         KeyCode::Up => wrap_nav(&mut state.selected_step, step_count, true),
         KeyCode::Down => wrap_nav(&mut state.selected_step, step_count, false),
-        KeyCode::Char('d') | KeyCode::Char('D') => {
-            if step_count > 0 {
+        KeyCode::Char('d') | KeyCode::Char('D')
+            if step_count > 0 => {
                 let (start, end) = state.step_selection_range();
                 if end < step_count {
                     let count = end - start + 1;
@@ -1253,7 +1354,6 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                     state.set_status(format!("Deleted {} step(s)", count));
                 }
             }
-        }
         KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Enter => {
             if let Some(step) = state.macros[idx].steps.get(state.selected_step) {
                 if let KeyAction::MouseScroll(_, clicks) = &step.action {
@@ -1267,30 +1367,27 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                 }
             }
         }
-        KeyCode::Char('k') | KeyCode::Char('K') => {
-            if state.selected_step > 0 {
+        KeyCode::Char('k') | KeyCode::Char('K')
+            if state.selected_step > 0 => {
                 state.macros[idx]
                     .steps
                     .swap(state.selected_step, state.selected_step - 1);
                 state.selected_step -= 1;
             }
-        }
-        KeyCode::Char('j') | KeyCode::Char('J') => {
-            if state.selected_step + 1 < step_count {
+        KeyCode::Char('j') | KeyCode::Char('J')
+            if state.selected_step + 1 < step_count => {
                 state.macros[idx]
                     .steps
                     .swap(state.selected_step, state.selected_step + 1);
                 state.selected_step += 1;
             }
-        }
-        KeyCode::Char('a') | KeyCode::Char('A') => {
+        KeyCode::Char('a') | KeyCode::Char('A')
             // Replace key/button (keeps Down/Up direction)
-            if step_count > 0 {
+            if step_count > 0 => {
                 state.editing_step_action = true;
                 AWAITING_HOTKEY.store(true, Ordering::SeqCst);
                 state.set_status_persistent("Press a key or mouse button to replace action...");
             }
-        }
         KeyCode::Char('s') | KeyCode::Char('S') => {
             // Swap Down <-> Up
             if let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
@@ -1306,45 +1403,37 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             }
         }
         KeyCode::Char('w') | KeyCode::Char('W') => {
-            // Insert scroll up step
-            let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
-            state.macros[idx].steps.insert(pos, MacroStep {
+            let step = MacroStep {
                 action: KeyAction::MouseScroll(ScrollDirection::Up, 1),
                 delay_ms: 0,
-            });
-            state.selected_step = pos;
+            };
+            state.selected_step = insert_step_after_selection(state, idx, step);
             state.set_status("Inserted Scroll Up");
         }
         KeyCode::Char('x') | KeyCode::Char('X') => {
-            // Insert scroll down step
-            let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
-            state.macros[idx].steps.insert(pos, MacroStep {
+            let step = MacroStep {
                 action: KeyAction::MouseScroll(ScrollDirection::Down, 1),
                 delay_ms: 0,
-            });
-            state.selected_step = pos;
+            };
+            state.selected_step = insert_step_after_selection(state, idx, step);
             state.set_status("Inserted Scroll Down");
         }
         KeyCode::Char('m') | KeyCode::Char('M') => {
-            // Insert MouseMove step at current cursor position
             let (cx, cy) = input::get_cursor_pos();
-            let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
-            state.macros[idx].steps.insert(pos, MacroStep {
+            let step = MacroStep {
                 action: KeyAction::MouseMove(cx, cy),
                 delay_ms: 0,
-            });
-            state.selected_step = pos;
+            };
+            state.selected_step = insert_step_after_selection(state, idx, step);
             state.set_status(format!("Inserted Move ({},{})", cx, cy));
         }
         KeyCode::Char('f') | KeyCode::Char('F') => {
-            // Insert WaitForWindow step using current foreground process
-            if let Some(ref fg) = state.foreground_process {
-                let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
-                state.macros[idx].steps.insert(pos, MacroStep {
+            if let Some(fg) = state.foreground_process.clone() {
+                let step = MacroStep {
                     action: KeyAction::WaitForWindow(fg.clone()),
                     delay_ms: 0,
-                });
-                state.selected_step = pos;
+                };
+                state.selected_step = insert_step_after_selection(state, idx, step);
                 state.set_status(format!("Inserted Wait for '{}'", fg));
             } else {
                 state.set_status("No foreground process detected");
@@ -1363,9 +1452,8 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             AWAITING_HOTKEY.store(true, Ordering::SeqCst);
             state.set_status_persistent("Press a key to insert (down+up pair)...");
         }
-        KeyCode::Char('c') | KeyCode::Char('C') => {
-            // Duplicate selected step(s)
-            if step_count > 0 {
+        KeyCode::Char('c') | KeyCode::Char('C')
+            if step_count > 0 => {
                 let (start, end) = state.step_selection_range();
                 let duped = state.macros[idx].steps[start..=end].to_vec();
                 let count = duped.len();
@@ -1376,18 +1464,14 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                 state.selection_anchor = None;
                 state.set_status(format!("Duplicated {} step(s)", count));
             }
-        }
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
-            // Copy selected step(s) to clipboard
-            if step_count > 0 {
+        KeyCode::Char('y') | KeyCode::Char('Y')
+            if step_count > 0 => {
                 let (start, end) = state.step_selection_range();
                 state.clipboard_steps = state.macros[idx].steps[start..=end].to_vec();
                 let count = state.clipboard_steps.len();
                 state.set_status(format!("Copied {} step(s)", count));
             }
-        }
         KeyCode::Char('p') | KeyCode::Char('P') => {
-            // Paste clipboard steps after selection
             if !state.clipboard_steps.is_empty() {
                 let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
                 let count = state.clipboard_steps.len();
@@ -1401,9 +1485,9 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                 state.set_status("Nothing to paste — copy first with y");
             }
         }
-        KeyCode::Char('v') | KeyCode::Char('V') => {
+        KeyCode::Char('v') | KeyCode::Char('V')
             // Toggle selection anchor
-            if step_count > 0 {
+            if step_count > 0 => {
                 if state.selection_anchor.is_some() {
                     state.selection_anchor = None;
                     state.set_status("Selection cleared");
@@ -1412,12 +1496,9 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                     state.set_status("Selection started — move with Up/Down, then y/c/d");
                 }
             }
-        }
         _ => {}
     }
 }
-
-// ── Process Picker ──
 
 fn handle_key_process_picker(state: &mut AppState, key: KeyCode) {
     let idx = match state.view {
@@ -1457,8 +1538,6 @@ fn handle_key_process_picker(state: &mut AppState, key: KeyCode) {
     }
 }
 
-// ── Chain Picker ──
-
 fn handle_key_chain_picker(state: &mut AppState, key: KeyCode) {
     let idx = match state.view {
         View::ChainPicker(i) => i,
@@ -1489,8 +1568,6 @@ fn handle_key_chain_picker(state: &mut AppState, key: KeyCode) {
     }
 }
 
-// ── Help ──
-
 fn handle_key_help(state: &mut AppState, key: KeyCode) {
     match key {
         KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
@@ -1505,8 +1582,6 @@ fn handle_key_help(state: &mut AppState, key: KeyCode) {
         _ => {}
     }
 }
-
-// ── Helpers ──
 
 /// Wrapping navigation: move cursor up/down in a list of `count` items.
 fn wrap_nav(current: &mut usize, count: usize, up: bool) {
@@ -1535,6 +1610,247 @@ fn update_hotkey_config(state: &AppState, config: &Arc<Mutex<HotkeyConfig>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn autosave_marks_dirty_without_touching_the_disk() {
+        let mut s = AppState::new();
+        assert!(!s.unsaved_changes);
+        autosave(&mut s);
+        assert!(s.unsaved_changes, "the event loop flushes it later");
+    }
+
+    #[test]
+    fn autosave_is_inert_when_the_config_failed_to_load() {
+        let mut s = AppState::new();
+        s.config_read_failed = true;
+        autosave(&mut s);
+        assert!(!s.unsaved_changes, "never overwrite a config we could not read");
+    }
+
+    #[test]
+    fn flush_is_a_noop_when_nothing_changed() {
+        let mut s = AppState::new();
+        s.config_read_failed = true;
+        s.unsaved_changes = true;
+        flush_pending_save(&mut s);
+        assert!(s.unsaved_changes, "blocked config keeps the flag, writes nothing");
+    }
+
+    //
+    // Characterisation tests: these pin the behaviour of handle_key_step_editor
+    // so the modal guards and the command match can be refactored safely.
+
+    fn step_editor_state(step_count: usize) -> AppState {
+        let mut s = AppState::new();
+        let mut mac = Macro::new("m".into());
+        for i in 0..step_count {
+            mac.steps.push(MacroStep {
+                action: KeyAction::KeyDown(i as u16 + 1),
+                delay_ms: 10,
+            });
+        }
+        s.macros.push(mac);
+        s.view = View::StepEditor(0);
+        s
+    }
+
+    fn press(state: &mut AppState, key: KeyCode) {
+        handle_key_step_editor(state, key, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn step_editor_ignores_keys_outside_its_view() {
+        let mut s = step_editor_state(3);
+        s.view = View::Main;
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.selected_step, 0, "no effect outside StepEditor");
+    }
+
+    #[test]
+    fn step_editor_navigation_wraps() {
+        let mut s = step_editor_state(3);
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.selected_step, 1);
+        press(&mut s, KeyCode::Down);
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.selected_step, 0, "wraps past the last step");
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.selected_step, 2, "wraps backwards");
+    }
+
+    #[test]
+    fn step_editor_esc_returns_to_config() {
+        let mut s = step_editor_state(1);
+        press(&mut s, KeyCode::Esc);
+        assert_eq!(s.view, View::Config(0));
+    }
+
+    #[test]
+    fn key_capture_mode_only_accepts_esc() {
+        let mut s = step_editor_state(2);
+        s.inserting_key_step = true;
+
+        press(&mut s, KeyCode::Down);
+        assert!(s.inserting_key_step, "other keys are swallowed");
+        assert_eq!(s.selected_step, 0, "navigation does not leak through");
+
+        press(&mut s, KeyCode::Esc);
+        assert!(!s.inserting_key_step, "Esc cancels capture");
+    }
+
+    #[test]
+    fn insert_text_commits_after_the_selection() {
+        let mut s = step_editor_state(3);
+        s.selected_step = 0;
+        s.inserting_text = true;
+        s.insert_text_buf = "hi".into();
+
+        press(&mut s, KeyCode::Enter);
+
+        assert!(!s.inserting_text);
+        assert!(s.insert_text_buf.is_empty(), "buffer cleared on commit");
+        assert_eq!(s.macros[0].steps.len(), 4);
+        assert_eq!(s.selected_step, 1, "selection follows the inserted step");
+        match &s.macros[0].steps[1].action {
+            KeyAction::TypeText(t) => assert_eq!(t, "hi"),
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_text_esc_discards_the_buffer() {
+        let mut s = step_editor_state(2);
+        s.inserting_text = true;
+        s.insert_text_buf = "hi".into();
+
+        press(&mut s, KeyCode::Esc);
+
+        assert!(!s.inserting_text);
+        assert!(s.insert_text_buf.is_empty());
+        assert_eq!(s.macros[0].steps.len(), 2, "no step added");
+    }
+
+    #[test]
+    fn insert_text_empty_buffer_adds_nothing() {
+        let mut s = step_editor_state(2);
+        s.inserting_text = true;
+
+        press(&mut s, KeyCode::Enter);
+
+        assert_eq!(s.macros[0].steps.len(), 2);
+        assert!(!s.inserting_text);
+    }
+
+    #[test]
+    fn insert_text_typing_accumulates_into_the_buffer() {
+        let mut s = step_editor_state(1);
+        s.inserting_text = true;
+
+        press(&mut s, KeyCode::Char('a'));
+        press(&mut s, KeyCode::Char('b'));
+
+        assert_eq!(s.insert_text_buf, "ab", "the clone-mutate-write-back path");
+    }
+
+    #[test]
+    fn step_delay_edit_commits_a_parsed_value() {
+        let mut s = step_editor_state(2);
+        s.selected_step = 1;
+        s.editing_step_delay = true;
+        s.step_delay_buf = "250".into();
+
+        press(&mut s, KeyCode::Enter);
+
+        assert_eq!(s.macros[0].steps[1].delay_ms, 250);
+        assert!(!s.editing_step_delay);
+        assert!(s.step_delay_buf.is_empty());
+    }
+
+    #[test]
+    fn step_delay_edit_ignores_an_unparseable_value() {
+        let mut s = step_editor_state(1);
+        s.editing_step_delay = true;
+        s.step_delay_buf = "abc".into();
+
+        press(&mut s, KeyCode::Enter);
+
+        assert_eq!(s.macros[0].steps[0].delay_ms, 10, "original delay kept");
+        assert!(!s.editing_step_delay, "edit mode still exits");
+    }
+
+    #[test]
+    fn step_delay_edit_esc_leaves_the_step_alone() {
+        let mut s = step_editor_state(1);
+        s.editing_step_delay = true;
+        s.step_delay_buf = "999".into();
+
+        press(&mut s, KeyCode::Esc);
+
+        assert_eq!(s.macros[0].steps[0].delay_ms, 10);
+        assert!(s.step_delay_buf.is_empty());
+    }
+
+    #[test]
+    fn step_delay_edit_rejects_letters() {
+        let mut s = step_editor_state(1);
+        s.editing_step_delay = true;
+
+        press(&mut s, KeyCode::Char('7'));
+        press(&mut s, KeyCode::Char('x'));
+
+        assert_eq!(s.step_delay_buf, "7", "numeric field takes digits only");
+    }
+
+    #[test]
+    fn scroll_clicks_edit_updates_the_selected_scroll_step() {
+        let mut s = step_editor_state(0);
+        s.macros[0].steps.push(MacroStep {
+            action: KeyAction::MouseScroll(ScrollDirection::Up, 1),
+            delay_ms: 0,
+        });
+        s.editing_scroll_clicks = true;
+        s.scroll_clicks_buf = "5".into();
+
+        press(&mut s, KeyCode::Enter);
+
+        match s.macros[0].steps[0].action {
+            KeyAction::MouseScroll(_, clicks) => assert_eq!(clicks, 5),
+            ref other => panic!("unexpected action: {other:?}"),
+        }
+        assert!(!s.editing_scroll_clicks);
+    }
+
+    #[test]
+    fn scroll_clicks_edit_rejects_zero() {
+        let mut s = step_editor_state(0);
+        s.macros[0].steps.push(MacroStep {
+            action: KeyAction::MouseScroll(ScrollDirection::Up, 3),
+            delay_ms: 0,
+        });
+        s.editing_scroll_clicks = true;
+        s.scroll_clicks_buf = "0".into();
+
+        press(&mut s, KeyCode::Enter);
+
+        match s.macros[0].steps[0].action {
+            KeyAction::MouseScroll(_, clicks) => assert_eq!(clicks, 3, "zero is ignored"),
+            ref other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn modal_guards_take_priority_over_commands() {
+        // 'd' deletes a step in command mode, but must be swallowed as text
+        // while a modal input is open.
+        let mut s = step_editor_state(3);
+        s.inserting_text = true;
+
+        press(&mut s, KeyCode::Char('d'));
+
+        assert_eq!(s.macros[0].steps.len(), 3, "no step deleted");
+        assert_eq!(s.insert_text_buf, "d", "captured as text instead");
+    }
 
     #[test]
     fn wrap_nav_down() {

@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test and lint (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+
+  windows:
+    name: Build and lint (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The Windows half of input.rs and audio.rs is cfg-gated out on Linux,
+      # so this job is the only thing that compiles its unsafe blocks.
+      - run: cargo build --release
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets

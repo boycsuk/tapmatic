@@ -1,8 +1,8 @@
 use crate::macro_def::KeyAction;
 
-// ── Windows API wrappers ──
-// These are only compiled on Windows. On other platforms we provide stubs
-// so the project can still be type-checked.
+// Only compiled on Windows. The non-Windows stubs below are no-ops that let
+// the crate build and the suite run off-Windows; no test exercising them
+// proves anything about real input behaviour.
 
 #[cfg(windows)]
 mod platform {
@@ -429,10 +429,9 @@ pub fn calc_cpu_percent(prev: (u64, u64), curr: (u64, u64)) -> u32 {
     let total_diff = curr.0.saturating_sub(prev.0);
     let idle_diff = curr.1.saturating_sub(prev.1);
     if total_diff == 0 { return 0; }
-    (((total_diff - idle_diff) * 100) / total_diff) as u32
+    let busy = total_diff.saturating_sub(idle_diff);
+    (busy.saturating_mul(100) / total_diff) as u32
 }
-
-// ── Scroll recording hook ──
 
 #[cfg(windows)]
 mod scroll_hook {
@@ -550,8 +549,8 @@ pub fn execute_action(action: &KeyAction) {
 
 /// Execute a MouseMove with jitter applied.
 pub fn execute_action_with_jitter(action: &KeyAction, jitter: u32, rng: &mut u64) {
-    if jitter > 0 {
-        if let KeyAction::MouseMove(x, y) = action {
+    if jitter > 0
+        && let KeyAction::MouseMove(x, y) = action {
             // xorshift64 for offset
             *rng ^= *rng << 13;
             *rng ^= *rng >> 7;
@@ -565,7 +564,6 @@ pub fn execute_action_with_jitter(action: &KeyAction, jitter: u32, rng: &mut u64
             send_mouse_move(x + dx, y + dy);
             return;
         }
-    }
     execute_action(action);
 }
 
@@ -612,14 +610,71 @@ fn type_text(text: &str) {
 #[cfg(not(windows))]
 fn type_text(_text: &str) {}
 
+/// A window handle resolved once and reused across a macro's steps.
+///
+/// Resolving costs a full EnumWindows sweep with an OpenProcess per visible
+/// window, so doing it per step made it the hottest path in the program.
+#[cfg(windows)]
+#[derive(Default)]
+pub struct WindowTarget {
+    hwnd: Option<windows::Win32::Foundation::HWND>,
+}
+
+#[cfg(not(windows))]
+#[derive(Default)]
+pub struct WindowTarget;
+
+impl WindowTarget {
+    #[cfg(windows)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(not(windows))]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Drop the cached handle so the next send re-resolves it.
+    pub fn invalidate(&mut self) {
+        #[cfg(windows)]
+        {
+            self.hwnd = None;
+        }
+    }
+}
+
 /// Execute a single KeyAction via PostMessage to a specific process window.
-/// Returns false if the window was not found.
-pub fn execute_action_to_process(action: &KeyAction, process: &str) -> bool {
+///
+/// Reuses the handle cached in `target`, resolving it only on the first call
+/// or after the window went away. Returns false if the window was not found.
+pub fn execute_action_to_process(
+    action: &KeyAction,
+    process: &str,
+    target: &mut WindowTarget,
+) -> bool {
     #[cfg(windows)]
     {
-        let Some(hwnd) = find_window_by_process(process) else {
-            return false;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+
+        // A cached handle goes stale when the window closes; IsWindow is a
+        // cheap check next to a full enumeration.
+        if let Some(hwnd) = target.hwnd
+            && !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+                target.hwnd = None;
+            }
+
+        let hwnd = match target.hwnd {
+            Some(hwnd) => hwnd,
+            None => {
+                let Some(found) = find_window_by_process(process) else {
+                    return false;
+                };
+                target.hwnd = Some(found);
+                found
+            }
         };
+
         match action {
             KeyAction::KeyDown(sc) => post_key(hwnd, *sc, false),
             KeyAction::KeyUp(sc) => post_key(hwnd, *sc, true),
@@ -648,7 +703,35 @@ pub fn execute_action_to_process(action: &KeyAction, process: &str) -> bool {
     }
     #[cfg(not(windows))]
     {
-        let _ = (action, process);
+        let _ = (action, process, target);
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_percent_half_busy() {
+        assert_eq!(calc_cpu_percent((0, 0), (100, 50)), 50);
+    }
+
+    #[test]
+    fn cpu_percent_fully_busy_and_fully_idle() {
+        assert_eq!(calc_cpu_percent((0, 0), (100, 0)), 100);
+        assert_eq!(calc_cpu_percent((0, 0), (100, 100)), 0);
+    }
+
+    #[test]
+    fn cpu_percent_identical_snapshots() {
+        assert_eq!(calc_cpu_percent((500, 250), (500, 250)), 0);
+    }
+
+    #[test]
+    fn cpu_percent_idle_exceeding_total_does_not_underflow() {
+        // Windows counters make this unreachable (kernel time includes idle),
+        // but the bare subtraction would underflow if it ever happened.
+        assert_eq!(calc_cpu_percent((1000, 800), (1100, 1000)), 0);
     }
 }
