@@ -169,11 +169,13 @@ impl Drop for HeldInputs {
         if let Some(process) = self.window_process.take() {
             // A vanished target has nothing left to release; falling back to
             // the global path would inject key-ups into the focused window.
+            let never_stop = AtomicBool::new(false);
             for &sc in &self.keys {
                 input::execute_action_to_process(
                     &KeyAction::KeyUp(sc),
                     &process,
                     &mut self.window_target,
+                    &never_stop,
                 );
             }
             for &btn in &self.mouse {
@@ -181,6 +183,7 @@ impl Drop for HeldInputs {
                     &KeyAction::MouseUp(btn),
                     &process,
                     &mut self.window_target,
+                    &never_stop,
                 );
             }
         } else {
@@ -216,7 +219,13 @@ fn execute_macro_inner(
     let mut last_progress_secs: u32 = u32::MAX;
     let vk = mac.hotkey_vk;
 
-    let mut rng_state: u64 = start_time.elapsed().as_nanos() as u64 | 1;
+    // Seeding from `start_time.elapsed()` here would yield a near-constant
+    // value, making every run's "random" delays identical.
+    let mut rng_state: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+        ^ (vk as u64) << 32
+        | 1;
 
     let window_mode = held.window_mode();
 
@@ -252,10 +261,7 @@ fn execute_macro_inner(
                     }
 
             let raw_delay = if let Some((min, max)) = mac.random_delay {
-                rng_state ^= rng_state << 13;
-                rng_state ^= rng_state >> 7;
-                rng_state ^= rng_state << 17;
-                random_delay_in_range(min, max, rng_state)
+                random_delay_in_range(min, max, input::xorshift64(&mut rng_state))
             } else if mac.use_recorded_delays {
                 step.delay_ms
             } else {
@@ -263,10 +269,7 @@ fn execute_macro_inner(
             };
 
             let humanized = if mac.humanize_ms > 0 && raw_delay > 0 {
-                rng_state ^= rng_state << 13;
-                rng_state ^= rng_state >> 7;
-                rng_state ^= rng_state << 17;
-                apply_humanize(raw_delay, mac.humanize_ms, rng_state)
+                apply_humanize(raw_delay, mac.humanize_ms, input::xorshift64(&mut rng_state))
             } else {
                 raw_delay
             };
@@ -299,8 +302,12 @@ fn execute_macro_inner(
                 if should_stop(stop_flag) { return; }
             } else if window_mode {
                 let process = mac.bound_process.as_deref().unwrap_or("");
-                while !input::execute_action_to_process(&step.action, process, &mut held.window_target)
-                {
+                while !input::execute_action_to_process(
+                    &step.action,
+                    process,
+                    &mut held.window_target,
+                    stop_flag,
+                ) {
                     if should_stop(stop_flag) {
                         return;
                     }
@@ -310,9 +317,14 @@ fn execute_macro_inner(
                     thread::sleep(Duration::from_millis(50));
                 }
             } else if mac.mouse_jitter > 0 {
-                input::execute_action_with_jitter(&step.action, mac.mouse_jitter, &mut rng_state);
+                input::execute_action_with_jitter(
+                    &step.action,
+                    mac.mouse_jitter,
+                    &mut rng_state,
+                    stop_flag,
+                );
             } else {
-                input::execute_action(&step.action);
+                input::execute_action(&step.action, stop_flag);
             }
         }
 

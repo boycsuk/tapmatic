@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forever with no way to stop it — the kill switch included. Chain starts now
   require a natural finish and obey the same gates as hotkey starts.
 - A macro thread that failed to spawn was reported as running forever.
+- The macro RNG was seeded from an `Instant` created moments earlier, so
+  every run produced the same "random" delay, humanize and jitter sequence —
+  the opposite of what those features exist for. Seeded from the system clock
+  now.
+- `TypeText` slept 5 ms per character with no stop check: a full-length text
+  blocked stop, quit and the executor loop for up to ~50 seconds. Typing now
+  aborts when the macro is stopped.
 
 - Deleting a macro while a search filter was active removed a different macro
   than the highlighted one, and the confirmation prompt named the wrong macro.

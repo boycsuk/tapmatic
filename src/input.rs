@@ -533,7 +533,17 @@ pub use scroll_hook::start as start_scroll_hook;
 pub use scroll_hook::stop as stop_scroll_hook;
 
 /// Execute a single KeyAction via SendInput (global, needs focus).
-pub fn execute_action(action: &KeyAction) {
+/// Advance the xorshift64 state and return the new value.
+///
+/// `state` must be nonzero: zero is xorshift's fixed point.
+pub fn xorshift64(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+pub fn execute_action(action: &KeyAction, stop: &std::sync::atomic::AtomicBool) {
     use crate::macro_def::ScrollDirection;
     match action {
         KeyAction::KeyDown(sc) => send_key(*sc, false),
@@ -542,40 +552,44 @@ pub fn execute_action(action: &KeyAction) {
         KeyAction::MouseUp(b) => send_mouse(*b, true),
         KeyAction::MouseScroll(dir, clicks) => send_mouse_scroll(*dir == ScrollDirection::Up, *clicks),
         KeyAction::MouseMove(x, y) => send_mouse_move(*x, *y),
-        KeyAction::TypeText(text) => type_text(text),
+        KeyAction::TypeText(text) => type_text(text, stop),
         KeyAction::WaitForWindow(_) => {} // handled by executor
     }
 }
 
 /// Execute a MouseMove with jitter applied.
-pub fn execute_action_with_jitter(action: &KeyAction, jitter: u32, rng: &mut u64) {
+pub fn execute_action_with_jitter(
+    action: &KeyAction,
+    jitter: u32,
+    rng: &mut u64,
+    stop: &std::sync::atomic::AtomicBool,
+) {
     if jitter > 0
         && let KeyAction::MouseMove(x, y) = action {
-            // xorshift64 for offset
-            *rng ^= *rng << 13;
-            *rng ^= *rng >> 7;
-            *rng ^= *rng << 17;
             let jitter_i = jitter as i32;
-            let dx = (*rng as i32 % (jitter_i * 2 + 1)) - jitter_i;
-            *rng ^= *rng << 13;
-            *rng ^= *rng >> 7;
-            *rng ^= *rng << 17;
-            let dy = (*rng as i32 % (jitter_i * 2 + 1)) - jitter_i;
+            let dx = (xorshift64(rng) as i32 % (jitter_i * 2 + 1)) - jitter_i;
+            let dy = (xorshift64(rng) as i32 % (jitter_i * 2 + 1)) - jitter_i;
             send_mouse_move(x + dx, y + dy);
             return;
         }
-    execute_action(action);
+    execute_action(action, stop);
 }
 
 /// Type a string by sending key events for each character.
+///
+/// Checks `stop` between characters: a full-length text takes ~50 s, and an
+/// uninterruptible loop here blocks the executor's stop/join for that long.
 #[cfg(windows)]
-fn type_text(text: &str) {
+fn type_text(text: &str, stop: &std::sync::atomic::AtomicBool) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
         KEYEVENTF_UNICODE, VIRTUAL_KEY,
     };
 
     for ch in text.encode_utf16() {
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         let down = INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
@@ -608,7 +622,7 @@ fn type_text(text: &str) {
 }
 
 #[cfg(not(windows))]
-fn type_text(_text: &str) {}
+fn type_text(_text: &str, _stop: &std::sync::atomic::AtomicBool) {}
 
 /// A window handle resolved once and reused across a macro's steps.
 ///
@@ -652,6 +666,7 @@ pub fn execute_action_to_process(
     action: &KeyAction,
     process: &str,
     target: &mut WindowTarget,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> bool {
     #[cfg(windows)]
     {
@@ -692,6 +707,9 @@ pub fn execute_action_to_process(
                 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
                 use windows::Win32::Foundation::{WPARAM, LPARAM};
                 for ch in text.encode_utf16() {
+                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
                     unsafe {
                         let _ = PostMessageW(Some(hwnd), 0x0102, WPARAM(ch as usize), LPARAM(0));
                     }
@@ -703,7 +721,7 @@ pub fn execute_action_to_process(
     }
     #[cfg(not(windows))]
     {
-        let _ = (action, process, target);
+        let _ = (action, process, target, stop);
         false
     }
 }
