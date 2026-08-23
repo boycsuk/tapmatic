@@ -62,7 +62,6 @@ pub fn process_record_event(state: &mut AppState, action: KeyAction, instant: In
         return;
     }
 
-    // Ignore orphan release events
     match action {
         KeyAction::KeyDown(sc) => {
             state.recording_pressed_keys.insert(sc);

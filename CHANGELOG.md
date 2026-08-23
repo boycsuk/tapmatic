@@ -134,3 +134,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `input.rs` understated the non-Windows stubs.
 - Removed four unused `windows` crate features and two write-only `AppState`
   fields.
+- Removed the leftovers the previous cleanup missed: the empty
+  `handle_key_recording` no-op, an orphaned `// Stats` banner, ~25 comments
+  restating the line below them, and three over-visible `pub` items. Fixed
+  the doc comments that had drifted from the code (a doc attached to the
+  wrong function in `input.rs`, a stale paragraph on `autosave` from its
+  synchronous era, and two smaller inaccuracies), and added one-line rustdoc
+  to the core public items (`AppState`, `Macro`, `KeyAction`, `AppEvent`,
+  `hotkey_loop`, `executor_loop`, `HotkeyConfig`).

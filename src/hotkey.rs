@@ -8,6 +8,7 @@ use crate::macro_def::{KeyAction, MouseButton, RepetitionMode};
 use crate::state::AppEvent;
 use crate::{AWAITING_HOTKEY, MOUSE_MOVE_THRESHOLD, QUICK_RECORD, RECORDING, RECORD_MOUSE_MOVES, RUNNING};
 
+/// Bound hotkeys shared between the UI thread (writer) and the scan loop.
 pub struct HotkeyConfig {
     pub bound_keys: Vec<(i32, RepetitionMode)>,
 }
@@ -78,6 +79,10 @@ enum Mode {
     Capture,
 }
 
+/// Poll global key state every `POLL_INTERVAL`, translating transitions into
+/// `AppEvent`s according to the current mode (normal, recording, capture).
+///
+/// Runs on its own thread until `RUNNING` drops.
 pub fn hotkey_loop(tx: mpsc::Sender<AppEvent>, config: Arc<Mutex<HotkeyConfig>>) {
     let mut prev_state = [false; 256];
     let mut last_mode = Mode::Normal;

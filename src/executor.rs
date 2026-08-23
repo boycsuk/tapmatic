@@ -25,6 +25,10 @@ impl ActiveMacro {
     }
 }
 
+/// Own the running macros: spawn a thread per started macro, stop and join
+/// them on command, and exit after draining a `StopAll`.
+///
+/// Runs on its own thread until `RUNNING` drops or the channel closes.
 pub fn executor_loop(rx: mpsc::Receiver<ExecutorCommand>, feedback_tx: mpsc::Sender<AppEvent>) {
     let mut active: HashMap<i32, ActiveMacro> = HashMap::new();
 
@@ -114,7 +118,8 @@ fn random_delay_in_range(min: u64, max: u64, rng_state: u64) -> u64 {
     }
 }
 
-/// Offset `raw_delay` by up to ±`humanize_ms`, with a floor of 1ms.
+/// Offset a nonzero `raw_delay` by up to ±`humanize_ms`, flooring at 1ms;
+/// a zero delay is returned unchanged.
 ///
 /// Saturates the span so an out-of-range `humanize_ms` cannot overflow.
 fn apply_humanize(raw_delay: u64, humanize_ms: u64, rng_state: u64) -> u64 {

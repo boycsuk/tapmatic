@@ -144,7 +144,7 @@ impl ConfigField {
     }
 }
 
-pub const CONFIG_TAB_BASIC: &[ConfigField] = &[
+const CONFIG_TAB_BASIC: &[ConfigField] = &[
     ConfigField::Name,
     ConfigField::Hotkey,
     ConfigField::RepetitionMode,
@@ -152,7 +152,7 @@ pub const CONFIG_TAB_BASIC: &[ConfigField] = &[
     ConfigField::StopValue,
 ];
 
-pub const CONFIG_TAB_TIMING: &[ConfigField] = &[
+const CONFIG_TAB_TIMING: &[ConfigField] = &[
     ConfigField::DelayMode,
     ConfigField::FixedInterval,
     ConfigField::RandomDelayMin,
@@ -162,7 +162,7 @@ pub const CONFIG_TAB_TIMING: &[ConfigField] = &[
     ConfigField::HumanizeMs,
 ];
 
-pub const CONFIG_TAB_ADVANCED: &[ConfigField] = &[
+const CONFIG_TAB_ADVANCED: &[ConfigField] = &[
     ConfigField::RequireHeld,
     ConfigField::ExclusiveGroup,
     ConfigField::ChainMacro,
@@ -207,6 +207,7 @@ impl ConfigField {
 }
 
 #[derive(Debug)]
+/// Messages from the background threads (hotkey, executor) to the UI loop.
 pub enum AppEvent {
     HotkeyPressed(i32),
     HotkeyReleased(i32),
@@ -230,6 +231,8 @@ pub enum ExecutorCommand {
     StopAll,
 }
 
+/// The whole mutable UI-thread state: macros, view, selections, edit buffers
+/// and status reporting.
 pub struct AppState {
     // Macro list
     pub macros: Vec<Macro>,
@@ -290,7 +293,7 @@ pub struct AppState {
     pub editing_scroll_clicks: bool,
     pub scroll_clicks_buf: String,
     pub selection_anchor: Option<usize>, // start of multi-select range
-    pub clipboard_steps: Vec<MacroStep>, // copied steps
+    pub clipboard_steps: Vec<MacroStep>,
 
     // Main view
     pub selected_button: usize,
@@ -315,19 +318,14 @@ pub struct AppState {
     // Undo
     pub undo_stack: Vec<Vec<Macro>>, // snapshots of macros list
 
-    // Stats
-
-    // Renaming
     pub renaming: bool,
     pub rename_buf: String,
 
     // Text cursor position for editable fields
     pub text_cursor: usize,
 
-    // Console visibility
     pub console_hidden: bool,
 
-    // Delete confirmation
     pub confirm_delete: bool,
 
     // System stats
@@ -335,7 +333,6 @@ pub struct AppState {
     pub ram_used_mb: u32,
     pub ram_total_mb: u32,
     pub uptime_secs: u64,
-    // Quit confirmation
     pub confirm_quit: bool,
 
     // Event channel (for starting scroll hook etc.)

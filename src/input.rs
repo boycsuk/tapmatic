@@ -278,8 +278,6 @@ mod platform {
         }
     }
 
-    /// Returns the executable name (e.g. "notepad.exe") of the foreground window,
-    /// or None if it can't be determined.
     /// Returns (total_time, idle_time) as raw ticks for CPU usage calculation.
     pub fn get_cpu_usage_snapshot() -> (u64, u64) {
         use windows::Win32::System::Threading::GetSystemTimes;
@@ -315,6 +313,8 @@ mod platform {
         (total_mb.saturating_sub(avail_mb), total_mb)
     }
 
+    /// Returns the executable name (e.g. "notepad.exe") of the foreground
+    /// window, or None if it can't be determined.
     pub fn get_foreground_process_name() -> Option<String> {
         use windows::Win32::UI::WindowsAndMessaging::{
             GetForegroundWindow, GetWindowThreadProcessId,
@@ -394,7 +394,6 @@ mod platform {
 
 }
 
-// Re-export platform functions
 pub use platform::*;
 
 /// Calculate CPU usage percentage from two snapshots.

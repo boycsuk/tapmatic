@@ -117,7 +117,6 @@ fn main() {
         .spawn(move || executor::executor_loop(cmd_rx, exec_tx))
         .expect("failed to spawn executor thread");
 
-    // Set terminal window title
     crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle("tapmatic")).ok();
 
     let mut terminal = ratatui::init();
@@ -535,7 +534,9 @@ fn handle_key(
 ) {
     match &state.view {
         View::Main => handle_key_main(state, key, mods, cmd_tx, hotkey_config),
-        View::Recording => handle_key_recording(state, key, hotkey_config),
+        // Recording controls (Esc, F1-F3, Alt+Z) arrive as AppEvents from the
+        // hotkey thread so they work without TUI focus; keys here are ignored.
+        View::Recording => {}
         View::Config(_) => handle_key_config(state, key, mods, hotkey_config),
         View::StepEditor(_) => handle_key_step_editor(state, key, mods),
         View::ProcessPicker(_) => handle_key_process_picker(state, key),
@@ -543,8 +544,6 @@ fn handle_key(
         View::Help => handle_key_help(state, key),
     }
 }
-
-// Up/Down = navigate macro list, Left/Right = navigate buttons, Enter = activate button
 
 fn activate_button(
     state: &mut AppState,
@@ -729,15 +728,12 @@ fn handle_key_main(
     }
 
     match key {
-        // List navigation
         KeyCode::Up => state.move_selection(true),
         KeyCode::Down => state.move_selection(false),
 
-        // Button bar navigation
         KeyCode::Left => wrap_nav(&mut state.selected_button, MAIN_BUTTONS.len(), true),
         KeyCode::Right => wrap_nav(&mut state.selected_button, MAIN_BUTTONS.len(), false),
 
-        // Enter = activate selected button
         KeyCode::Enter => {
             activate_button(state, cmd_tx, hotkey_config);
         }
@@ -753,7 +749,6 @@ fn handle_key_main(
         }
 
         KeyCode::Char('z') | KeyCode::Char('Z') => {
-            // Undo
             if state.pop_undo() {
                 update_hotkey_config(state, hotkey_config);
                 autosave(state);
@@ -763,7 +758,6 @@ fn handle_key_main(
             }
         }
         KeyCode::F(2) => {
-            // Rename selected macro inline
             if let Some(real_idx) = resolve_selected_macro(state) {
                 state.renaming = true;
                 state.rename_buf = state.macros[real_idx].name.clone();
@@ -772,7 +766,6 @@ fn handle_key_main(
             }
         }
         KeyCode::Char('k') | KeyCode::Char('K') => {
-            // Move macro up
             if let Some(real_idx) = resolve_selected_macro(state)
                 && real_idx > 0 {
                     state.push_undo();
@@ -782,7 +775,6 @@ fn handle_key_main(
                 }
         }
         KeyCode::Char('j') | KeyCode::Char('J') => {
-            // Move macro down
             if let Some(real_idx) = resolve_selected_macro(state)
                 && real_idx + 1 < state.macros.len() {
                     state.push_undo();
@@ -794,7 +786,6 @@ fn handle_key_main(
                 }
         }
         KeyCode::Char('/') => {
-            // Search
             state.searching = true;
             state.search_query.clear();
             state.text_cursor = 0;
@@ -850,15 +841,6 @@ fn handle_key_main(
     }
 }
 
-fn handle_key_recording(
-    _state: &mut AppState,
-    _key: KeyCode,
-    _hotkey_config: &Arc<Mutex<HotkeyConfig>>,
-) {
-    // All recording controls (Esc, F1, F2, F3, Alt+Z) are handled via AppEvent
-    // from the hotkey thread so they work without TUI focus.
-}
-
 fn save_config(state: &mut AppState, idx: usize, hotkey_config: &Arc<Mutex<HotkeyConfig>>) {
     apply_config_field(state, idx);
     state.config_macro_backup = None;
@@ -899,10 +881,6 @@ fn request_quit(state: &mut AppState) {
     }
 }
 
-/// Persist the current state, reporting any failure in the status bar.
-///
-/// Does nothing when the config on disk could not be parsed at startup, so a
-/// save never overwrites a file we failed to read.
 /// Mark the config dirty so the event loop flushes it shortly.
 ///
 /// Called from every mutating key handler, so it must not touch the disk: the
@@ -1051,7 +1029,6 @@ fn handle_key_config(
                     state.set_status_persistent("Press the key that must be held...");
                 }
                 ConfigField::ChainMacro => {
-                    // Open chain macro picker
                     state.chain_list = state
                         .macros
                         .iter()
@@ -1063,13 +1040,11 @@ fn handle_key_config(
                     state.view = View::ChainPicker(idx);
                 }
                 ConfigField::BoundProcess => {
-                    // Open process picker
                     state.process_list = input::get_window_list();
                     state.selected_process = 0;
                     state.view = View::ProcessPicker(idx);
                 }
                 _ => {
-                    // Move to next field
                     state.config_field = state.config_field.next_in_tab(state.config_tab);
                     prefill_config_buf(state, idx);
                 }
@@ -1345,7 +1320,8 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                     KeyAction::KeyUp(sc) => KeyAction::KeyDown(sc),
                     KeyAction::MouseDown(b) => KeyAction::MouseUp(b),
                     KeyAction::MouseUp(b) => KeyAction::MouseDown(b),
-                    other => other, // TypeText stays as-is
+                    // Steps without a direction (TypeText, scroll, move, wait)
+                    other => other,
                 };
                 let name = step.action.display_name();
                 state.set_status(format!("Swapped to {}", name));
@@ -1389,14 +1365,12 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             }
         }
         KeyCode::Char('i') | KeyCode::Char('I') => {
-            // Insert TypeText step
             state.inserting_text = true;
             state.insert_text_buf.clear();
             state.text_cursor = 0;
             state.set_status_persistent("Type text and press Enter to insert...");
         }
         KeyCode::Char('n') | KeyCode::Char('N') => {
-            // Insert key step via capture
             state.inserting_key_step = true;
             AWAITING_HOTKEY.store(true, Ordering::SeqCst);
             state.set_status_persistent("Press a key to insert (down+up pair)...");

@@ -47,6 +47,7 @@ pub enum ScrollDirection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A single replayable input event, the unit a macro's steps are made of.
 pub enum KeyAction {
     KeyDown(u16),
     KeyUp(u16),
@@ -229,6 +230,7 @@ impl StopCondition {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// A named, hotkey-bound sequence of steps plus its replay settings.
 pub struct Macro {
     pub name: String,
     pub steps: Vec<MacroStep>,
