@@ -129,7 +129,7 @@ mod platform {
     }
 
     /// Get the exe name (lowercase) of a process by PID.
-    fn exe_name_from_pid(pid: u32) -> Option<String> {
+    pub(super) fn exe_name_from_pid(pid: u32) -> Option<String> {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Threading::{
             OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
@@ -654,6 +654,10 @@ fn type_text(_text: &str, _stop: &std::sync::atomic::AtomicBool) {}
 #[derive(Default)]
 pub struct WindowTarget {
     hwnd: Option<windows::Win32::Foundation::HWND>,
+    /// Windows recycles HWND values, so `IsWindow` alone can validate a
+    /// handle that now belongs to a different program; ownership is
+    /// re-verified on a coarse interval.
+    last_identity_check: Option<std::time::Instant>,
 }
 
 #[cfg(not(windows))]
@@ -676,8 +680,22 @@ impl WindowTarget {
         #[cfg(windows)]
         {
             self.hwnd = None;
+            self.last_identity_check = None;
         }
     }
+}
+
+#[cfg(windows)]
+const IDENTITY_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[cfg(windows)]
+fn window_belongs_to_process(hwnd: windows::Win32::Foundation::HWND, process: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    pid != 0
+        && platform::exe_name_from_pid(pid).is_some_and(|name| name == process.to_lowercase())
 }
 
 /// Execute a single KeyAction via PostMessage to a specific process window.
@@ -701,6 +719,18 @@ pub fn execute_action_to_process(
                 target.hwnd = None;
             }
 
+        if let Some(hwnd) = target.hwnd
+            && target
+                .last_identity_check
+                .is_none_or(|at| at.elapsed() >= IDENTITY_RECHECK_INTERVAL)
+        {
+            if window_belongs_to_process(hwnd, process) {
+                target.last_identity_check = Some(std::time::Instant::now());
+            } else {
+                target.hwnd = None;
+            }
+        }
+
         let hwnd = match target.hwnd {
             Some(hwnd) => hwnd,
             None => {
@@ -708,6 +738,7 @@ pub fn execute_action_to_process(
                     return false;
                 };
                 target.hwnd = Some(found);
+                target.last_identity_check = Some(std::time::Instant::now());
                 found
             }
         };

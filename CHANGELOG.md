@@ -56,6 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   button, making it fire on every click anywhere.
 - A poisoned hotkey-config lock silently disabled all hotkeys (and hotkey
   updates) for the rest of the session.
+- Window-mode targeting validated its cached handle with `IsWindow` only;
+  Windows recycles handle values, so a target that closed mid-run could
+  leave the macro posting keystrokes into an unrelated program. Ownership is
+  now re-verified against the bound process every 500 ms.
 
 - Deleting a macro while a search filter was active removed a different macro
   than the highlighted one, and the confirmation prompt named the wrong macro.
