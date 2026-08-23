@@ -37,10 +37,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   codes, delays, step counts and `TypeText` lengths at the untrusted-input
   boundary.
 - Tests for the persistence layer, the executor's delay arithmetic, the
-  recorder's event filtering and `calc_cpu_percent`, none of which had any.
+  recorder's event filtering, `calc_cpu_percent` and the step editor's key
+  handling, none of which had any.
+- CI workflow building and linting on Linux and Windows. The Windows-only half
+  of `input.rs` and `audio.rs` was never compiled by a Linux-only build.
+
+### Performance
+
+- Config writes no longer happen synchronously inside key handlers; changes are
+  flushed at most once per second and on quit.
+- The foreground process is polled ~4 times per second rather than every frame.
+- In Window mode the target window is resolved once per macro and revalidated,
+  instead of a full `EnumWindows` sweep for every step.
 
 ### Changed
 
+- Extracted the repeated modal text-input pattern and the shared picker chrome;
+  `handle_key_step_editor` drops from 290 to 182 lines.
+- Toolbar dispatch uses named button constants instead of bare integers.
+- Removed 48 decorative section banners and comments that restated the code.
 - Corrected doc comments that described behaviour the code does not have:
   `speed_multiplier` documented the reciprocal of what it stores, `config_path`
   claimed the config is always in the home directory, and the platform note in
