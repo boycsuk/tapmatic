@@ -902,9 +902,22 @@ fn draw_step_editor(f: &mut Frame, state: &AppState, idx: usize) {
 
 // ── Process Picker View ──
 
-fn draw_process_picker(f: &mut Frame, state: &AppState, _idx: usize) {
-    let area = f.area();
-
+/// Shared chrome for the picker views: status bar, bordered table and a
+/// footer of help keys.
+#[allow(clippy::too_many_arguments)]
+fn draw_list_picker(
+    f: &mut Frame,
+    state: &AppState,
+    title: String,
+    title_style: Style,
+    border_style: Style,
+    header: Row,
+    widths: &[Constraint],
+    rows: Vec<Row>,
+    selected: usize,
+    pos: String,
+    footer: Vec<Span>,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -912,15 +925,31 @@ fn draw_process_picker(f: &mut Frame, state: &AppState, _idx: usize) {
             Constraint::Min(3),
             Constraint::Length(3),
         ])
-        .split(area);
+        .split(f.area());
 
     f.render_widget(Paragraph::new(status_bar(state)), chunks[0]);
 
-    let total = state.process_list.len();
-    let pos = format_pos(state.selected_process, total, "no windows");
+    let table = Table::new(rows, widths.to_vec()).header(header).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(Span::styled(title, title_style))
+            .title_bottom(status_or_pos(state, pos)),
+    );
 
-    let header = Row::new(vec![Cell::from("  Process"), Cell::from("Window")])
-        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+    let mut table_state = TableState::default().with_selected(Some(selected));
+    f.render_stateful_widget(table, chunks[1], &mut table_state);
+
+    let bottom_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let bottom_inner = bottom_block.inner(chunks[2]);
+    f.render_widget(bottom_block, chunks[2]);
+    f.render_widget(Paragraph::new(Line::from(footer)), bottom_inner);
+}
+
+fn draw_process_picker(f: &mut Frame, state: &AppState, _idx: usize) {
+    let total = state.process_list.len();
 
     let rows: Vec<Row> = state
         .process_list
@@ -941,58 +970,32 @@ fn draw_process_picker(f: &mut Frame, state: &AppState, _idx: usize) {
         })
         .collect();
 
-    let widths = [Constraint::Length(25), Constraint::Min(20)];
+    let mut footer = Vec::new();
+    footer.extend(help_key("Enter", "Select", GREEN));
+    footer.extend(help_key("Bksp", "Clear", YELLOW));
+    footer.extend(help_key("F5", "Refresh", ACCENT));
+    footer.extend(help_key("Esc", "Back", RED));
 
-    let table = Table::new(rows, widths).header(header).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(DIM))
-            .title(Span::styled(
-                format!(" Select Process ({}) ", total),
-                Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
-            ))
-            .title_bottom(status_or_pos(state, pos)),
+    draw_list_picker(
+        f,
+        state,
+        format!(" Select Process ({}) ", total),
+        Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
+        Style::default().fg(DIM),
+        Row::new(vec![Cell::from("  Process"), Cell::from("Window")])
+            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        &[Constraint::Length(25), Constraint::Min(20)],
+        rows,
+        state.selected_process,
+        format_pos(state.selected_process, total, "no windows"),
+        footer,
     );
-
-    let mut table_state = TableState::default().with_selected(Some(state.selected_process));
-    f.render_stateful_widget(table, chunks[1], &mut table_state);
-
-    // Bottom block
-    let bottom_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(DIM));
-    let bottom_inner = bottom_block.inner(chunks[2]);
-    f.render_widget(bottom_block, chunks[2]);
-
-    let mut spans = Vec::new();
-    spans.extend(help_key("Enter", "Select", GREEN));
-    spans.extend(help_key("Bksp", "Clear", YELLOW));
-    spans.extend(help_key("F5", "Refresh", ACCENT));
-    spans.extend(help_key("Esc", "Back", RED));
-    f.render_widget(Paragraph::new(Line::from(spans)), bottom_inner);
 }
 
 // ── Chain Picker View ──
 
 fn draw_chain_picker(f: &mut Frame, state: &AppState, _idx: usize) {
-    let area = f.area();
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(3),
-        ])
-        .split(area);
-
-    f.render_widget(Paragraph::new(status_bar(state)), chunks[0]);
-
     let total = state.chain_list.len();
-    let pos = format_pos(state.selected_chain, total, "no macros");
-
-    let header = Row::new(vec![Cell::from("  Macro name")])
-        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = state
         .chain_list
@@ -1005,33 +1008,25 @@ fn draw_chain_picker(f: &mut Frame, state: &AppState, _idx: usize) {
         })
         .collect();
 
-    let widths = [Constraint::Min(20)];
+    let mut footer = Vec::new();
+    footer.extend(help_key("Enter", "Select", GREEN));
+    footer.extend(help_key("Bksp", "Clear", YELLOW));
+    footer.extend(help_key("Esc", "Back", RED));
 
-    let table = Table::new(rows, widths).header(header).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(BORDER_STYLE)
-            .title(Span::styled(
-                format!(" Chain to ({}) ", total),
-                Style::default().fg(DIM),
-            ))
-            .title_bottom(status_or_pos(state, pos)),
+    draw_list_picker(
+        f,
+        state,
+        format!(" Chain to ({}) ", total),
+        Style::default().fg(DIM),
+        BORDER_STYLE,
+        Row::new(vec![Cell::from("  Macro name")])
+            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        &[Constraint::Min(20)],
+        rows,
+        state.selected_chain,
+        format_pos(state.selected_chain, total, "no macros"),
+        footer,
     );
-
-    let mut table_state = TableState::default().with_selected(Some(state.selected_chain));
-    f.render_stateful_widget(table, chunks[1], &mut table_state);
-
-    let bottom_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(BORDER_STYLE);
-    let bottom_inner = bottom_block.inner(chunks[2]);
-    f.render_widget(bottom_block, chunks[2]);
-
-    let mut spans = Vec::new();
-    spans.extend(help_key("Enter", "Select", GREEN));
-    spans.extend(help_key("Bksp", "Clear", YELLOW));
-    spans.extend(help_key("Esc", "Back", RED));
-    f.render_widget(Paragraph::new(Line::from(spans)), bottom_inner);
 }
 
 // ── Help View ──
