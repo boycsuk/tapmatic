@@ -613,14 +613,71 @@ fn type_text(text: &str) {
 #[cfg(not(windows))]
 fn type_text(_text: &str) {}
 
+/// A window handle resolved once and reused across a macro's steps.
+///
+/// Resolving costs a full EnumWindows sweep with an OpenProcess per visible
+/// window, so doing it per step made it the hottest path in the program.
+#[cfg(windows)]
+#[derive(Default)]
+pub struct WindowTarget {
+    hwnd: Option<windows::Win32::Foundation::HWND>,
+}
+
+#[cfg(not(windows))]
+#[derive(Default)]
+pub struct WindowTarget;
+
+impl WindowTarget {
+    #[cfg(windows)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(not(windows))]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Drop the cached handle so the next send re-resolves it.
+    pub fn invalidate(&mut self) {
+        #[cfg(windows)]
+        {
+            self.hwnd = None;
+        }
+    }
+}
+
 /// Execute a single KeyAction via PostMessage to a specific process window.
-/// Returns false if the window was not found.
-pub fn execute_action_to_process(action: &KeyAction, process: &str) -> bool {
+///
+/// Reuses the handle cached in `target`, resolving it only on the first call
+/// or after the window went away. Returns false if the window was not found.
+pub fn execute_action_to_process(
+    action: &KeyAction,
+    process: &str,
+    target: &mut WindowTarget,
+) -> bool {
     #[cfg(windows)]
     {
-        let Some(hwnd) = find_window_by_process(process) else {
-            return false;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+
+        // A cached handle goes stale when the window closes; IsWindow is a
+        // cheap check next to a full enumeration.
+        if let Some(hwnd) = target.hwnd
+            && !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+                target.hwnd = None;
+            }
+
+        let hwnd = match target.hwnd {
+            Some(hwnd) => hwnd,
+            None => {
+                let Some(found) = find_window_by_process(process) else {
+                    return false;
+                };
+                target.hwnd = Some(found);
+                found
+            }
         };
+
         match action {
             KeyAction::KeyDown(sc) => post_key(hwnd, *sc, false),
             KeyAction::KeyUp(sc) => post_key(hwnd, *sc, true),
@@ -649,7 +706,7 @@ pub fn execute_action_to_process(action: &KeyAction, process: &str) -> bool {
     }
     #[cfg(not(windows))]
     {
-        let _ = (action, process);
+        let _ = (action, process, target);
         false
     }
 }

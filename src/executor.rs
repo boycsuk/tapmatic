@@ -158,6 +158,7 @@ fn execute_macro_inner(
     let mut rng_state: u64 = start_time.elapsed().as_nanos() as u64 | 1;
 
     let window_mode = mac.send_mode == SendMode::Window && mac.bound_process.is_some();
+    let mut window_target = input::WindowTarget::new();
 
     // Start delay (countdown before first execution)
     if mac.start_delay_ms > 0
@@ -243,10 +244,13 @@ fn execute_macro_inner(
                 if should_stop(stop_flag) { return; }
             } else if window_mode {
                 let process = mac.bound_process.as_deref().unwrap_or("");
-                while !input::execute_action_to_process(&step.action, process) {
+                while !input::execute_action_to_process(&step.action, process, &mut window_target) {
                     if should_stop(stop_flag) {
                         return;
                     }
+                    // The cached handle is already gone by now; drop it so the
+                    // retry re-resolves instead of failing on a stale one.
+                    window_target.invalidate();
                     thread::sleep(Duration::from_millis(50));
                 }
             } else if mac.mouse_jitter > 0 {
