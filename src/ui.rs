@@ -69,7 +69,7 @@ fn status_bar(state: &AppState) -> Line<'_> {
 
 fn system_stats_title(state: &AppState) -> Line<'_> {
     let cpu_color = if state.cpu_usage > 80 { RED } else if state.cpu_usage > 50 { YELLOW } else { DIM };
-    let ram_pct = if state.ram_total_mb > 0 { (state.ram_used_mb * 100) / state.ram_total_mb } else { 0 };
+    let ram_pct = (state.ram_used_mb * 100).checked_div(state.ram_total_mb).unwrap_or(0);
     let ram_color = if ram_pct > 85 { RED } else if ram_pct > 60 { YELLOW } else { DIM };
 
     let secs = state.uptime_secs;

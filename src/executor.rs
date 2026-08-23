@@ -134,11 +134,10 @@ fn execute_macro_inner(
     let window_mode = mac.send_mode == SendMode::Window && mac.bound_process.is_some();
 
     // Start delay (countdown before first execution)
-    if mac.start_delay_ms > 0 {
-        if sleep_interruptible(mac.start_delay_ms, stop_flag) {
+    if mac.start_delay_ms > 0
+        && sleep_interruptible(mac.start_delay_ms, stop_flag) {
             return;
         }
-    }
 
     loop {
         for step in &mac.steps {
@@ -157,9 +156,9 @@ fn execute_macro_inner(
             }
 
             // Process focus check (Global mode only)
-            if !window_mode {
-                if let Some(ref bound) = mac.bound_process {
-                    if !is_bound_process_focused(bound) {
+            if !window_mode
+                && let Some(ref bound) = mac.bound_process
+                    && !is_bound_process_focused(bound) {
                         while !should_stop(stop_flag) && !is_bound_process_focused(bound) {
                             thread::sleep(Duration::from_millis(50));
                         }
@@ -167,8 +166,6 @@ fn execute_macro_inner(
                             return;
                         }
                     }
-                }
-            }
 
             // Compute delay
             let raw_delay = if let Some((min, max)) = mac.random_delay {
@@ -199,11 +196,10 @@ fn execute_macro_inner(
 
             let delay = apply_speed(humanized);
 
-            if delay > 0 {
-                if sleep_interruptible(delay, stop_flag) {
+            if delay > 0
+                && sleep_interruptible(delay, stop_flag) {
                     return;
                 }
-            }
 
             // Track pressed state before executing
             match &step.action {

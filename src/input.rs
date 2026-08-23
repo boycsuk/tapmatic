@@ -550,8 +550,8 @@ pub fn execute_action(action: &KeyAction) {
 
 /// Execute a MouseMove with jitter applied.
 pub fn execute_action_with_jitter(action: &KeyAction, jitter: u32, rng: &mut u64) {
-    if jitter > 0 {
-        if let KeyAction::MouseMove(x, y) = action {
+    if jitter > 0
+        && let KeyAction::MouseMove(x, y) = action {
             // xorshift64 for offset
             *rng ^= *rng << 13;
             *rng ^= *rng >> 7;
@@ -565,7 +565,6 @@ pub fn execute_action_with_jitter(action: &KeyAction, jitter: u32, rng: &mut u64
             send_mouse_move(x + dx, y + dy);
             return;
         }
-    }
     execute_action(action);
 }
 

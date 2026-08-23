@@ -75,17 +75,15 @@ fn migrate_old_format() -> AppConfig {
         Some(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("macros.json")),
     ];
     for candidate in candidates.into_iter().flatten() {
-        if candidate.exists() {
-            if let Ok(data) = fs::read_to_string(&candidate) {
-                if let Ok(macros) = serde_json::from_str::<Vec<Macro>>(&data) {
+        if candidate.exists()
+            && let Ok(data) = fs::read_to_string(&candidate)
+                && let Ok(macros) = serde_json::from_str::<Vec<Macro>>(&data) {
                     let config = AppConfig { macros, ..AppConfig::default() };
                     // Save in new format and remove old file
                     let _ = save(&config);
                     let _ = fs::remove_file(&candidate);
                     return config;
                 }
-            }
-        }
     }
     AppConfig::default()
 }

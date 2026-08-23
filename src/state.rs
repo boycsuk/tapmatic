@@ -322,11 +322,10 @@ impl AppState {
     }
 
     pub fn clear_stale_status(&mut self) {
-        if let Some((_, t, persistent)) = &self.status_message {
-            if !persistent && t.elapsed().as_secs() >= 3 {
+        if let Some((_, t, persistent)) = &self.status_message
+            && !persistent && t.elapsed().as_secs() >= 3 {
                 self.status_message = None;
             }
-        }
     }
 
     pub fn is_macro_active(&self, vk: i32) -> bool {
@@ -513,7 +512,7 @@ impl AppState {
     pub fn apply_sort(&mut self) {
         match self.sort_mode {
             SortMode::None => {}
-            SortMode::Name => self.macros.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            SortMode::Name => self.macros.sort_by_key(|a| a.name.to_lowercase()),
             SortMode::Hotkey => self.macros.sort_by_key(|m| m.hotkey_vk),
         }
         self.selected_macro = 0;

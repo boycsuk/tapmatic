@@ -106,7 +106,7 @@ fn run_app(
 
         // Update system stats every ~1 second (60 frames)
         frame_count += 1;
-        if frame_count % 60 == 0 {
+        if frame_count.is_multiple_of(60) {
             let new_snapshot = input::get_cpu_usage_snapshot();
             state.cpu_usage = input::calc_cpu_percent(cpu_snapshot, new_snapshot);
             cpu_snapshot = new_snapshot;
@@ -143,13 +143,11 @@ fn run_app(
             handle_app_event(state, ev, cmd_tx, hotkey_config);
         }
 
-        if event::poll(Duration::from_millis(16))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+        if event::poll(Duration::from_millis(16))?
+            && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press {
                     handle_key(state, key.code, key.modifiers, cmd_tx, hotkey_config);
                 }
-            }
-        }
     }
 }
 
@@ -234,17 +232,16 @@ fn handle_app_event(
             }
         }
         AppEvent::HotkeyReleased(vk) => {
-            if let Some((_, mac)) = state.macro_by_hotkey(vk) {
-                if mac.repetition == RepetitionMode::HoldToRepeat && state.is_macro_active(vk) {
+            if let Some((_, mac)) = state.macro_by_hotkey(vk)
+                && mac.repetition == RepetitionMode::HoldToRepeat && state.is_macro_active(vk) {
                     let _ = cmd_tx.send(ExecutorCommand::StopMacro(vk));
                     state.set_macro_active(vk, false);
                     audio::play_deactivate();
                 }
-            }
         }
         AppEvent::HotkeyCaptured(vk) => {
-            if state.awaiting_hotkey || state.awaiting_require_held {
-                if let View::Config(idx) = state.view {
+            if (state.awaiting_hotkey || state.awaiting_require_held)
+                && let View::Config(idx) = state.view {
                     // Check for duplicate hotkey before mutable borrow
                     let dupe_name = if state.awaiting_hotkey {
                         state.macros.iter().enumerate()
@@ -270,9 +267,8 @@ fn handle_app_event(
                         state.set_status(label);
                     }
                 }
-            }
-            if state.editing_step_action {
-                if let View::StepEditor(idx) = state.view {
+            if state.editing_step_action
+                && let View::StepEditor(idx) = state.view {
                     let sc = input::vk_to_scancode(vk);
                     if let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
                         let is_down = matches!(
@@ -288,9 +284,8 @@ fn handle_app_event(
                     state.editing_step_action = false;
                     AWAITING_HOTKEY.store(false, Ordering::SeqCst);
                 }
-            }
-            if state.inserting_key_step {
-                if let View::StepEditor(idx) = state.view {
+            if state.inserting_key_step
+                && let View::StepEditor(idx) = state.view {
                     let sc = input::vk_to_scancode(vk);
                     if let (Some(action_down), Some(action_up)) = (
                         KeyAction::from_vk(vk, sc, true),
@@ -306,7 +301,6 @@ fn handle_app_event(
                     state.inserting_key_step = false;
                     AWAITING_HOTKEY.store(false, Ordering::SeqCst);
                 }
-            }
         }
         AppEvent::MacroProgress(vk, reps, secs) => {
             state.macro_progress.insert(vk, (reps, secs));
@@ -563,13 +557,12 @@ fn handle_key_main(
     if state.renaming {
         match key {
             KeyCode::Enter => {
-                if let Some(real_idx) = resolve_selected_macro(state) {
-                    if !state.rename_buf.is_empty() {
+                if let Some(real_idx) = resolve_selected_macro(state)
+                    && !state.rename_buf.is_empty() {
                         state.macros[real_idx].name = state.rename_buf.clone();
                         state.set_status(format!("Renamed to '{}'", state.rename_buf));
                         autosave(state);
                     }
-                }
                 state.renaming = false;
                 state.rename_buf.clear();
             }
@@ -694,19 +687,18 @@ fn handle_key_main(
         }
         KeyCode::Char('k') | KeyCode::Char('K') => {
             // Move macro up
-            if let Some(real_idx) = resolve_selected_macro(state) {
-                if real_idx > 0 {
+            if let Some(real_idx) = resolve_selected_macro(state)
+                && real_idx > 0 {
                     state.push_undo();
                     state.macros.swap(real_idx, real_idx - 1);
                     state.selected_macro = state.selected_macro.saturating_sub(1);
                     autosave(state);
                 }
-            }
         }
         KeyCode::Char('j') | KeyCode::Char('J') => {
             // Move macro down
-            if let Some(real_idx) = resolve_selected_macro(state) {
-                if real_idx + 1 < state.macros.len() {
+            if let Some(real_idx) = resolve_selected_macro(state)
+                && real_idx + 1 < state.macros.len() {
                     state.push_undo();
                     state.macros.swap(real_idx, real_idx + 1);
                     if state.selected_macro + 1 < state.filtered_macro_indices().len() {
@@ -714,7 +706,6 @@ fn handle_key_main(
                     }
                     autosave(state);
                 }
-            }
         }
         KeyCode::Char('/') => {
             // Search
@@ -1004,17 +995,15 @@ fn handle_key_config(
 
 fn apply_config_field(state: &mut AppState, idx: usize) {
     match state.config_field {
-        ConfigField::Name => {
-            if !state.config_input_buf.is_empty() {
+        ConfigField::Name
+            if !state.config_input_buf.is_empty() => {
                 state.macros[idx].name = state.config_input_buf.clone();
             }
-        }
         ConfigField::FixedInterval => {
-            if let Ok(ms) = state.config_input_buf.parse::<u64>() {
-                if ms > 0 {
+            if let Ok(ms) = state.config_input_buf.parse::<u64>()
+                && ms > 0 {
                     state.macros[idx].fixed_interval_ms = ms;
                 }
-            }
         }
         ConfigField::RandomDelayMin => {
             if let Ok(ms) = state.config_input_buf.parse::<u64>() {
@@ -1031,11 +1020,10 @@ fn apply_config_field(state: &mut AppState, idx: usize) {
             }
         }
         ConfigField::StopValue => {
-            if let Ok(val) = state.config_input_buf.parse::<u32>() {
-                if val > 0 {
+            if let Ok(val) = state.config_input_buf.parse::<u32>()
+                && val > 0 {
                     state.macros[idx].stop_condition = state.macros[idx].stop_condition.with_value(val);
                 }
-            }
         }
         ConfigField::CycleDelay => {
             if let Ok(ms) = state.config_input_buf.parse::<u64>() {
@@ -1185,16 +1173,13 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
     if state.editing_scroll_clicks {
         match key {
             KeyCode::Enter => {
-                if let Ok(clicks) = state.scroll_clicks_buf.parse::<u32>() {
-                    if clicks > 0 {
-                        if let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
-                            if let KeyAction::MouseScroll(dir, ref mut c) = step.action {
+                if let Ok(clicks) = state.scroll_clicks_buf.parse::<u32>()
+                    && clicks > 0
+                        && let Some(step) = state.macros[idx].steps.get_mut(state.selected_step)
+                            && let KeyAction::MouseScroll(dir, ref mut c) = step.action {
                                 *c = clicks;
                                 state.set_status(format!("Scroll {} x{}", if dir == ScrollDirection::Up { "up" } else { "down" }, clicks));
                             }
-                        }
-                    }
-                }
                 state.editing_scroll_clicks = false;
                 state.scroll_clicks_buf.clear();
             }
@@ -1214,11 +1199,10 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
     if state.editing_step_delay {
         match key {
             KeyCode::Enter => {
-                if let Ok(ms) = state.step_delay_buf.parse::<u64>() {
-                    if let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
+                if let Ok(ms) = state.step_delay_buf.parse::<u64>()
+                    && let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
                         step.delay_ms = ms;
                     }
-                }
                 state.editing_step_delay = false;
                 state.step_delay_buf.clear();
             }
@@ -1241,8 +1225,8 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
         }
         KeyCode::Up => wrap_nav(&mut state.selected_step, step_count, true),
         KeyCode::Down => wrap_nav(&mut state.selected_step, step_count, false),
-        KeyCode::Char('d') | KeyCode::Char('D') => {
-            if step_count > 0 {
+        KeyCode::Char('d') | KeyCode::Char('D')
+            if step_count > 0 => {
                 let (start, end) = state.step_selection_range();
                 if end < step_count {
                     let count = end - start + 1;
@@ -1253,7 +1237,6 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                     state.set_status(format!("Deleted {} step(s)", count));
                 }
             }
-        }
         KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Enter => {
             if let Some(step) = state.macros[idx].steps.get(state.selected_step) {
                 if let KeyAction::MouseScroll(_, clicks) = &step.action {
@@ -1267,30 +1250,27 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                 }
             }
         }
-        KeyCode::Char('k') | KeyCode::Char('K') => {
-            if state.selected_step > 0 {
+        KeyCode::Char('k') | KeyCode::Char('K')
+            if state.selected_step > 0 => {
                 state.macros[idx]
                     .steps
                     .swap(state.selected_step, state.selected_step - 1);
                 state.selected_step -= 1;
             }
-        }
-        KeyCode::Char('j') | KeyCode::Char('J') => {
-            if state.selected_step + 1 < step_count {
+        KeyCode::Char('j') | KeyCode::Char('J')
+            if state.selected_step + 1 < step_count => {
                 state.macros[idx]
                     .steps
                     .swap(state.selected_step, state.selected_step + 1);
                 state.selected_step += 1;
             }
-        }
-        KeyCode::Char('a') | KeyCode::Char('A') => {
+        KeyCode::Char('a') | KeyCode::Char('A')
             // Replace key/button (keeps Down/Up direction)
-            if step_count > 0 {
+            if step_count > 0 => {
                 state.editing_step_action = true;
                 AWAITING_HOTKEY.store(true, Ordering::SeqCst);
                 state.set_status_persistent("Press a key or mouse button to replace action...");
             }
-        }
         KeyCode::Char('s') | KeyCode::Char('S') => {
             // Swap Down <-> Up
             if let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
@@ -1363,9 +1343,9 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             AWAITING_HOTKEY.store(true, Ordering::SeqCst);
             state.set_status_persistent("Press a key to insert (down+up pair)...");
         }
-        KeyCode::Char('c') | KeyCode::Char('C') => {
+        KeyCode::Char('c') | KeyCode::Char('C')
             // Duplicate selected step(s)
-            if step_count > 0 {
+            if step_count > 0 => {
                 let (start, end) = state.step_selection_range();
                 let duped = state.macros[idx].steps[start..=end].to_vec();
                 let count = duped.len();
@@ -1376,16 +1356,14 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                 state.selection_anchor = None;
                 state.set_status(format!("Duplicated {} step(s)", count));
             }
-        }
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
+        KeyCode::Char('y') | KeyCode::Char('Y')
             // Copy selected step(s) to clipboard
-            if step_count > 0 {
+            if step_count > 0 => {
                 let (start, end) = state.step_selection_range();
                 state.clipboard_steps = state.macros[idx].steps[start..=end].to_vec();
                 let count = state.clipboard_steps.len();
                 state.set_status(format!("Copied {} step(s)", count));
             }
-        }
         KeyCode::Char('p') | KeyCode::Char('P') => {
             // Paste clipboard steps after selection
             if !state.clipboard_steps.is_empty() {
@@ -1401,9 +1379,9 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                 state.set_status("Nothing to paste — copy first with y");
             }
         }
-        KeyCode::Char('v') | KeyCode::Char('V') => {
+        KeyCode::Char('v') | KeyCode::Char('V')
             // Toggle selection anchor
-            if step_count > 0 {
+            if step_count > 0 => {
                 if state.selection_anchor.is_some() {
                     state.selection_anchor = None;
                     state.set_status("Selection cleared");
@@ -1412,7 +1390,6 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                     state.set_status("Selection started — move with Up/Down, then y/c/d");
                 }
             }
-        }
         _ => {}
     }
 }
