@@ -86,6 +86,32 @@ fn apply_speed(delay_ms: u64) -> u64 {
     (delay_ms as f64 * mult) as u64
 }
 
+/// Pick a delay within `[min, max]` from the RNG state.
+///
+/// Saturates on a full-range span: `max - min + 1` wraps to zero, and a zero
+/// divisor panics in release as well as debug.
+fn random_delay_in_range(min: u64, max: u64, rng_state: u64) -> u64 {
+    if min >= max {
+        return min;
+    }
+    match (max - min).checked_add(1) {
+        Some(span) => min + (rng_state % span),
+        None => min + rng_state,
+    }
+}
+
+/// Offset `raw_delay` by up to ±`humanize_ms`, with a floor of 1ms.
+///
+/// Saturates the span so an out-of-range `humanize_ms` cannot overflow.
+fn apply_humanize(raw_delay: u64, humanize_ms: u64, rng_state: u64) -> u64 {
+    if humanize_ms == 0 || raw_delay == 0 {
+        return raw_delay;
+    }
+    let span = humanize_ms.saturating_mul(2).saturating_add(1);
+    let jitter = (rng_state % span) as i64 - humanize_ms as i64;
+    (raw_delay as i64).saturating_add(jitter).max(1) as u64
+}
+
 fn sleep_interruptible(ms: u64, stop_flag: &AtomicBool) -> bool {
     let mut remaining = ms;
     while remaining > 0 && !should_stop(stop_flag) {
@@ -169,27 +195,21 @@ fn execute_macro_inner(
 
             // Compute delay
             let raw_delay = if let Some((min, max)) = mac.random_delay {
-                if min >= max {
-                    min
-                } else {
-                    rng_state ^= rng_state << 13;
-                    rng_state ^= rng_state >> 7;
-                    rng_state ^= rng_state << 17;
-                    min + (rng_state % (max - min + 1))
-                }
+                rng_state ^= rng_state << 13;
+                rng_state ^= rng_state >> 7;
+                rng_state ^= rng_state << 17;
+                random_delay_in_range(min, max, rng_state)
             } else if mac.use_recorded_delays {
                 step.delay_ms
             } else {
                 mac.fixed_interval_ms
             };
 
-            // Apply humanize jitter: ±humanize_ms
             let humanized = if mac.humanize_ms > 0 && raw_delay > 0 {
                 rng_state ^= rng_state << 13;
                 rng_state ^= rng_state >> 7;
                 rng_state ^= rng_state << 17;
-                let jitter = (rng_state % (mac.humanize_ms * 2 + 1)) as i64 - mac.humanize_ms as i64;
-                (raw_delay as i64 + jitter).max(1) as u64
+                apply_humanize(raw_delay, mac.humanize_ms, rng_state)
             } else {
                 raw_delay
             };
@@ -274,4 +294,56 @@ fn execute_macro_inner(
 fn is_bound_process_focused(bound: &str) -> bool {
     input::get_foreground_process_name()
         .is_some_and(|fg| fg == bound)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_delay_stays_within_range() {
+        for rng in [0, 1, u64::MAX / 2, u64::MAX] {
+            let d = random_delay_in_range(10, 20, rng);
+            assert!((10..=20).contains(&d), "{d} outside [10, 20]");
+        }
+    }
+
+    #[test]
+    fn random_delay_collapsed_range_returns_min() {
+        assert_eq!(random_delay_in_range(50, 50, 12345), 50);
+        assert_eq!(random_delay_in_range(80, 20, 12345), 80);
+    }
+
+    #[test]
+    fn random_delay_full_span_does_not_panic() {
+        // max - min + 1 wraps to zero here; a zero divisor would panic even in
+        // release, killing the macro thread mid-execution.
+        let d = random_delay_in_range(0, u64::MAX, 999);
+        assert_eq!(d, 999);
+    }
+
+    #[test]
+    fn humanize_stays_within_jitter_bounds() {
+        for rng in [0, 7, u64::MAX] {
+            let d = apply_humanize(100, 10, rng);
+            assert!((90..=110).contains(&d), "{d} outside 100±10");
+        }
+    }
+
+    #[test]
+    fn humanize_floors_at_one_ms() {
+        assert_eq!(apply_humanize(1, 500, 0), 1, "never returns a zero delay");
+    }
+
+    #[test]
+    fn humanize_zero_is_identity() {
+        assert_eq!(apply_humanize(42, 0, 999), 42);
+        assert_eq!(apply_humanize(0, 99, 999), 0);
+    }
+
+    #[test]
+    fn humanize_extreme_value_does_not_overflow() {
+        let d = apply_humanize(50, u64::MAX, 12345);
+        assert!(d >= 1);
+    }
 }

@@ -429,7 +429,8 @@ pub fn calc_cpu_percent(prev: (u64, u64), curr: (u64, u64)) -> u32 {
     let total_diff = curr.0.saturating_sub(prev.0);
     let idle_diff = curr.1.saturating_sub(prev.1);
     if total_diff == 0 { return 0; }
-    (((total_diff - idle_diff) * 100) / total_diff) as u32
+    let busy = total_diff.saturating_sub(idle_diff);
+    (busy.saturating_mul(100) / total_diff) as u32
 }
 
 // ── Scroll recording hook ──
@@ -649,5 +650,33 @@ pub fn execute_action_to_process(action: &KeyAction, process: &str) -> bool {
     {
         let _ = (action, process);
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_percent_half_busy() {
+        assert_eq!(calc_cpu_percent((0, 0), (100, 50)), 50);
+    }
+
+    #[test]
+    fn cpu_percent_fully_busy_and_fully_idle() {
+        assert_eq!(calc_cpu_percent((0, 0), (100, 0)), 100);
+        assert_eq!(calc_cpu_percent((0, 0), (100, 100)), 0);
+    }
+
+    #[test]
+    fn cpu_percent_identical_snapshots() {
+        assert_eq!(calc_cpu_percent((500, 250), (500, 250)), 0);
+    }
+
+    #[test]
+    fn cpu_percent_idle_exceeding_total_does_not_underflow() {
+        // Windows counters make this unreachable (kernel time includes idle),
+        // but the bare subtraction would underflow if it ever happened.
+        assert_eq!(calc_cpu_percent((1000, 800), (1100, 1000)), 0);
     }
 }
