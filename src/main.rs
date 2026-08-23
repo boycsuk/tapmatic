@@ -1668,6 +1668,144 @@ mod tests {
         handle_key_step_editor(state, key, KeyModifiers::NONE);
     }
 
+    fn main_harness() -> (
+        mpsc::Sender<ExecutorCommand>,
+        mpsc::Receiver<ExecutorCommand>,
+        Arc<Mutex<HotkeyConfig>>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        (tx, rx, Arc::new(Mutex::new(HotkeyConfig::new())))
+    }
+
+    fn named_macros(names: &[&str]) -> AppState {
+        let mut s = AppState::new();
+        for (i, name) in names.iter().enumerate() {
+            let mut mac = Macro::new((*name).into());
+            mac.hotkey_vk = 0x41 + i as i32;
+            s.macros.push(mac);
+        }
+        s
+    }
+
+    #[test]
+    fn delete_under_filter_removes_the_highlighted_macro() {
+        let (tx, _rx, cfg) = main_harness();
+        let mut s = named_macros(&["alpha", "beta", "gamma"]);
+        s.search_query = "gamma".into();
+        s.selected_macro = 0;
+        s.confirm_delete = true;
+
+        handle_key_main(&mut s, KeyCode::Enter, KeyModifiers::NONE, &tx, &cfg);
+
+        let names: Vec<&str> = s.macros.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "beta"], "must delete the filtered-to macro");
+    }
+
+    #[test]
+    fn delete_prompt_names_the_filtered_macro() {
+        let (tx, _rx, cfg) = main_harness();
+        let mut s = named_macros(&["alpha", "beta", "gamma"]);
+        s.search_query = "beta".into();
+        s.selected_macro = 0;
+
+        s.selected_button = BTN_DELETE;
+        activate_button(&mut s, &tx, &cfg);
+
+        assert!(s.confirm_delete);
+        assert!(
+            s.status_message.as_ref().is_some_and(|(m, _, _)| m.contains("beta")),
+            "prompt must name the macro that will actually be deleted"
+        );
+    }
+
+    #[test]
+    fn f3_sort_snapshots_undo_and_marks_dirty() {
+        let (tx, _rx, cfg) = main_harness();
+        let mut s = named_macros(&["zeta", "alpha"]);
+
+        handle_key_main(&mut s, KeyCode::F(3), KeyModifiers::NONE, &tx, &cfg);
+
+        assert_eq!(s.sort_mode, state::SortMode::Name);
+        assert_eq!(s.macros[0].name, "alpha");
+        assert_eq!(s.undo_stack.len(), 1, "manual order must be undoable");
+        assert!(s.unsaved_changes, "the sorted order must persist");
+    }
+
+    #[test]
+    fn hotkey_toggle_starts_then_stops() {
+        let (tx, rx, cfg) = main_harness();
+        let mut s = named_macros(&["m"]);
+        let vk = s.macros[0].hotkey_vk;
+
+        handle_app_event(&mut s, AppEvent::HotkeyPressed(vk), &tx, &cfg);
+        assert!(s.is_macro_active(vk));
+        assert!(matches!(rx.try_recv(), Ok(ExecutorCommand::StartMacro(_))));
+
+        handle_app_event(&mut s, AppEvent::HotkeyPressed(vk), &tx, &cfg);
+        assert!(!s.is_macro_active(vk));
+        assert!(matches!(rx.try_recv(), Ok(ExecutorCommand::StopMacro(v)) if v == vk));
+    }
+
+    #[test]
+    fn exclusive_group_stops_the_running_peer() {
+        let (tx, rx, cfg) = main_harness();
+        let mut s = named_macros(&["a", "b"]);
+        s.macros[0].exclusive_group = Some("g".into());
+        s.macros[1].exclusive_group = Some("g".into());
+        let (vk_a, vk_b) = (s.macros[0].hotkey_vk, s.macros[1].hotkey_vk);
+
+        handle_app_event(&mut s, AppEvent::HotkeyPressed(vk_a), &tx, &cfg);
+        handle_app_event(&mut s, AppEvent::HotkeyPressed(vk_b), &tx, &cfg);
+
+        assert!(!s.is_macro_active(vk_a), "peer in the group must stop");
+        assert!(s.is_macro_active(vk_b));
+        let cmds: Vec<ExecutorCommand> = rx.try_iter().collect();
+        assert!(
+            cmds.iter().any(|c| matches!(c, ExecutorCommand::StopMacro(v) if *v == vk_a)),
+            "expected a StopMacro for the peer, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn chain_start_respects_the_kill_switch() {
+        let (tx, rx, cfg) = main_harness();
+        let mut s = named_macros(&["target"]);
+        s.macros_enabled = false;
+
+        handle_app_event(&mut s, AppEvent::ChainMacro("target".into()), &tx, &cfg);
+
+        assert!(rx.try_recv().is_err(), "disabled macros must not chain-start");
+    }
+
+    #[test]
+    fn chain_start_launches_an_allowed_macro() {
+        let (tx, rx, cfg) = main_harness();
+        let mut s = named_macros(&["target"]);
+
+        handle_app_event(&mut s, AppEvent::ChainMacro("target".into()), &tx, &cfg);
+
+        assert!(matches!(rx.try_recv(), Ok(ExecutorCommand::StartMacro(m)) if m.name == "target"));
+    }
+
+    #[test]
+    fn record_key_outside_recording_view_is_ignored() {
+        let (tx, _rx, cfg) = main_harness();
+        let mut s = AppState::new();
+        s.view = View::Main;
+
+        handle_app_event(
+            &mut s,
+            AppEvent::RecordKey(KeyAction::KeyDown(30), std::time::Instant::now()),
+            &tx,
+            &cfg,
+        );
+
+        assert!(
+            s.recording_steps.is_empty(),
+            "keys typed outside recording mode must not be captured"
+        );
+    }
+
     #[test]
     fn step_editor_ignores_keys_outside_its_view() {
         let mut s = step_editor_state(3);

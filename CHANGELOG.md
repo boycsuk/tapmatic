@@ -85,6 +85,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Regression tests for the previously fixed bugs that had none: deleting
+  under an active search filter, the F3 sort's undo snapshot and persistence,
+  and the whole persistence layer through its real `load`/`save`/migration
+  entry points. New behavior tests cover hotkey toggle semantics, exclusive
+  groups, chain gating, the recording view gate, and the executor's
+  `AfterReps` stop condition.
+- The hotkey edge-detection logic is extracted into pure functions
+  (previously it was welded to `GetAsyncKeyState`, untestable on any
+  platform) and covered by an edge-table test suite.
 - Macro fields are validated and clamped when loaded, bounding virtual-key
   codes, delays, step counts and `TypeText` lengths at the untrusted-input
   boundary.

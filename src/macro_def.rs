@@ -383,7 +383,7 @@ fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) {
 }
 
 /// Virtual-key codes are a byte; 0 means "unbound".
-fn is_valid_vk(vk: i32) -> bool {
+pub fn is_valid_vk(vk: i32) -> bool {
     (1..=254).contains(&vk)
 }
 
