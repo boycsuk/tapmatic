@@ -1,8 +1,9 @@
 use crate::macro_def::KeyAction;
 
 // ── Windows API wrappers ──
-// These are only compiled on Windows. On other platforms we provide stubs
-// so the project can still be type-checked.
+// Only compiled on Windows. The non-Windows stubs below are no-ops that let
+// the crate build and the suite run off-Windows; no test exercising them
+// proves anything about real input behaviour.
 
 #[cfg(windows)]
 mod platform {

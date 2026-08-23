@@ -733,7 +733,9 @@ fn handle_key_main(
                 state::SortMode::Name => state::SortMode::Hotkey,
                 state::SortMode::Hotkey => state::SortMode::None,
             };
+            state.push_undo();
             state.apply_sort();
+            autosave(state);
             let label = match state.sort_mode {
                 state::SortMode::None => "No sort",
                 state::SortMode::Name => "Sorted by name",

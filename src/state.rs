@@ -149,7 +149,9 @@ pub struct AppState {
 
     // Global toggle
     pub macros_enabled: bool,
-    /// Global speed multiplier (1.0 = normal, 0.5 = 2x fast, 2.0 = 2x slow)
+    /// Delay multiplier applied to every step: values above 1.0 slow playback
+    /// down, below 1.0 speed it up. The UI displays its reciprocal, so a stored
+    /// 0.25 is shown as "x4.00".
     pub speed_multiplier: f64,
 
     // Audio

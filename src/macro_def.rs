@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn serde_backward_compat_missing_new_fields() {
-        // Simulates loading a macro saved BEFORE mouse_jitter, mouse_scroll, etc. existed
+        // Every #[serde(default)] field must fall back cleanly when absent.
         let old_json = r#"[{
             "name": "Old Macro",
             "steps": [{"action": {"KeyDown": 30}, "delay_ms": 50}],

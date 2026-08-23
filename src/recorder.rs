@@ -5,6 +5,10 @@ use crate::macro_def::{KeyAction, Macro, MacroStep};
 use crate::state::{AppState, View};
 use crate::{audio, input, RECORDING, RECORD_MOUSE_MOVES};
 
+/// Begin capturing input into a new macro.
+///
+/// Sets the global `RECORDING` flag, installs the OS scroll hook and
+/// switches the view to `Recording`.
 pub fn start_recording(state: &mut AppState) {
     state.recording_name = state.next_macro_name();
     state.recording_steps.clear();
@@ -20,6 +24,11 @@ pub fn start_recording(state: &mut AppState) {
     audio::play_record_start();
 }
 
+/// Finish capturing and return the recorded macro.
+///
+/// Clears the global `RECORDING` and `RECORD_MOUSE_MOVES` flags, removes the
+/// scroll hook and drains the captured steps out of `state`, so calling it
+/// twice yields an empty macro.
 pub fn stop_recording(state: &mut AppState) -> Macro {
     RECORDING.store(false, Ordering::SeqCst);
     RECORD_MOUSE_MOVES.store(false, Ordering::SeqCst);
@@ -35,6 +44,7 @@ pub fn stop_recording(state: &mut AppState) -> Macro {
     mac
 }
 
+/// Pause or resume capture, discarding the time spent paused.
 pub fn toggle_pause(state: &mut AppState) {
     state.recording_paused = !state.recording_paused;
     if state.recording_paused {
@@ -43,6 +53,10 @@ pub fn toggle_pause(state: &mut AppState) {
     }
 }
 
+/// Append a captured input event to the recording.
+///
+/// Drops release events with no matching press, and records the delay since
+/// the previous event (zero for the first). Ignored while paused.
 pub fn process_record_event(state: &mut AppState, action: KeyAction, instant: Instant) {
     if state.recording_paused {
         return;
@@ -77,4 +91,64 @@ pub fn process_record_event(state: &mut AppState, action: KeyAction, instant: In
 
     state.recording_last_instant = Some(instant);
     state.recording_steps.push(MacroStep { action, delay_ms });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::macro_def::MouseButton;
+    use std::time::Duration;
+
+    fn recording_state() -> AppState {
+        let mut s = AppState::new();
+        s.recording_steps.clear();
+        s.recording_last_instant = None;
+        s
+    }
+
+    #[test]
+    fn orphan_release_events_are_dropped() {
+        let mut s = recording_state();
+        let now = Instant::now();
+
+        process_record_event(&mut s, KeyAction::KeyUp(30), now);
+        assert!(s.recording_steps.is_empty(), "release with no matching press");
+
+        process_record_event(&mut s, KeyAction::MouseUp(MouseButton::Left), now);
+        assert!(s.recording_steps.is_empty(), "mouse release with no matching press");
+    }
+
+    #[test]
+    fn matched_press_release_pair_is_recorded() {
+        let mut s = recording_state();
+        let now = Instant::now();
+
+        process_record_event(&mut s, KeyAction::KeyDown(30), now);
+        process_record_event(&mut s, KeyAction::KeyUp(30), now + Duration::from_millis(40));
+
+        assert_eq!(s.recording_steps.len(), 2);
+        assert_eq!(s.recording_steps[0].delay_ms, 0, "first event has no delay");
+        assert_eq!(s.recording_steps[1].delay_ms, 40);
+    }
+
+    #[test]
+    fn events_are_ignored_while_paused() {
+        let mut s = recording_state();
+        s.recording_paused = true;
+
+        process_record_event(&mut s, KeyAction::KeyDown(30), Instant::now());
+        assert!(s.recording_steps.is_empty());
+    }
+
+    #[test]
+    fn release_is_dropped_only_once_per_press() {
+        let mut s = recording_state();
+        let now = Instant::now();
+
+        process_record_event(&mut s, KeyAction::KeyDown(30), now);
+        process_record_event(&mut s, KeyAction::KeyUp(30), now);
+        process_record_event(&mut s, KeyAction::KeyUp(30), now);
+
+        assert_eq!(s.recording_steps.len(), 2, "the second release is an orphan");
+    }
 }

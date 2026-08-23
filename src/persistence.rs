@@ -36,12 +36,14 @@ impl Default for AppConfig {
 }
 
 fn config_path() -> PathBuf {
-    // Always in user home directory
     dirs_fallback().join(FILE_NAME)
 }
 
+/// Resolve the config directory: `USERPROFILE` on Windows, `HOME` on Unix.
+///
+/// With neither set the config lands in the working directory, so the file
+/// read depends on where the binary was launched from.
 fn dirs_fallback() -> PathBuf {
-    // USERPROFILE on Windows, HOME on Unix
     std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .map(PathBuf::from)
