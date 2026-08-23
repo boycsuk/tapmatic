@@ -481,9 +481,9 @@ fn activate_button(
         }
         3 => {
             // Delete
-            if !state.macros.is_empty() {
+            if let Some(real_idx) = resolve_selected_macro(state) {
                 state.confirm_delete = true;
-                let name = &state.macros[state.selected_macro].name;
+                let name = &state.macros[real_idx].name;
                 state.set_status_persistent(format!("Delete '{}'? Enter=yes  Esc=no", name));
             } else {
                 state.set_status("No macros to delete");
@@ -603,15 +603,15 @@ fn handle_key_main(
     if state.confirm_delete {
         match key {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if state.selected_macro < state.macros.len() {
+                if let Some(real_idx) = resolve_selected_macro(state) {
                     state.push_undo();
-                    let name = state.macros[state.selected_macro].name.clone();
-                    let vk = state.macros[state.selected_macro].hotkey_vk;
+                    let name = state.macros[real_idx].name.clone();
+                    let vk = state.macros[real_idx].hotkey_vk;
                     if state.is_macro_active(vk) {
                         let _ = cmd_tx.send(ExecutorCommand::StopMacro(vk));
                         state.set_macro_active(vk, false);
                     }
-                    state.macros.remove(state.selected_macro);
+                    state.macros.remove(real_idx);
                     state.clamp_selection();
                     state.set_status(format!("Deleted '{}'", name));
                     update_hotkey_config(state, hotkey_config);

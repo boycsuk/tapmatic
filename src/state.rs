@@ -354,8 +354,12 @@ impl AppState {
         format!("Macro {}", self.macros.len() + 1)
     }
 
+    /// Move the selection cursor one row up or down, wrapping at the ends.
+    ///
+    /// Wraps against the visible (filtered) row count, since `selected_macro`
+    /// indexes the filtered list rather than `macros`.
     pub fn move_selection(&mut self, up: bool) {
-        let count = self.macros.len();
+        let count = self.filtered_macro_indices().len();
         if count == 0 {
             return;
         }
@@ -464,10 +468,13 @@ impl AppState {
         format!("{}|{}", left, right)
     }
 
+    /// Clamp the selection cursor into the visible (filtered) list.
+    ///
+    /// `selected_macro` indexes the filtered list, not `macros`, so the bound
+    /// is the number of visible rows.
     pub fn clamp_selection(&mut self) {
-        if self.selected_macro >= self.macros.len() && self.selected_macro > 0 {
-            self.selected_macro -= 1;
-        }
+        let visible = self.filtered_macro_indices().len();
+        self.selected_macro = self.selected_macro.min(visible.saturating_sub(1));
     }
 
     pub fn push_undo(&mut self) {
@@ -572,13 +579,52 @@ mod tests {
     #[test]
     fn clamp_selection_adjusts() {
         let mut s = state_with_macros(&["A", "B"]);
-        s.selected_macro = 5; // out of bounds
+        s.selected_macro = 5;
         s.clamp_selection();
-        assert_eq!(s.selected_macro, 4); // decrements by 1 (still out, but that's the contract)
+        assert_eq!(s.selected_macro, 1);
 
         s.selected_macro = 2;
         s.clamp_selection();
         assert_eq!(s.selected_macro, 1);
+    }
+
+    #[test]
+    fn filtered_selection_resolves_to_real_index() {
+        let mut s = state_with_macros(&["alpha", "beta", "gamma"]);
+        s.search_query = "gam".into();
+        s.selected_macro = 0; // first (and only) visible row
+
+        let filtered = s.filtered_macro_indices();
+        let real = filtered[s.selected_macro];
+        assert_eq!(real, 2, "display row 0 under this filter is macros[2]");
+        assert_eq!(s.macros[real].name, "gamma");
+    }
+
+    #[test]
+    fn clamp_selection_bounds_to_filtered_list() {
+        let mut s = state_with_macros(&["alpha", "beta", "gamma"]);
+        s.search_query = "a".into(); // matches alpha, beta, gamma
+        s.selected_macro = 2;
+        s.clamp_selection();
+        assert_eq!(s.selected_macro, 2);
+
+        s.search_query = "alph".into(); // matches alpha only
+        s.clamp_selection();
+        assert_eq!(s.selected_macro, 0);
+    }
+
+    #[test]
+    fn move_selection_wraps_within_filtered_list() {
+        let mut s = state_with_macros(&["alpha", "beta", "gamma"]);
+        s.search_query = "a".into();
+        s.selected_macro = 2;
+        s.move_selection(false);
+        assert_eq!(s.selected_macro, 0, "wraps at the end of the visible list");
+
+        s.search_query = "et".into(); // matches beta only
+        s.selected_macro = 0;
+        s.move_selection(false);
+        assert_eq!(s.selected_macro, 0, "single visible row stays put");
     }
 
     #[test]
