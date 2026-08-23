@@ -1537,6 +1537,223 @@ fn update_hotkey_config(state: &AppState, config: &Arc<Mutex<HotkeyConfig>>) {
 mod tests {
     use super::*;
 
+
+    // ── Step editor key handling ──
+    //
+    // Characterisation tests: these pin the behaviour of handle_key_step_editor
+    // so the modal guards and the command match can be refactored safely.
+
+    fn step_editor_state(step_count: usize) -> AppState {
+        let mut s = AppState::new();
+        let mut mac = Macro::new("m".into());
+        for i in 0..step_count {
+            mac.steps.push(MacroStep {
+                action: KeyAction::KeyDown(i as u16 + 1),
+                delay_ms: 10,
+            });
+        }
+        s.macros.push(mac);
+        s.view = View::StepEditor(0);
+        s
+    }
+
+    fn press(state: &mut AppState, key: KeyCode) {
+        handle_key_step_editor(state, key, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn step_editor_ignores_keys_outside_its_view() {
+        let mut s = step_editor_state(3);
+        s.view = View::Main;
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.selected_step, 0, "no effect outside StepEditor");
+    }
+
+    #[test]
+    fn step_editor_navigation_wraps() {
+        let mut s = step_editor_state(3);
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.selected_step, 1);
+        press(&mut s, KeyCode::Down);
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.selected_step, 0, "wraps past the last step");
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.selected_step, 2, "wraps backwards");
+    }
+
+    #[test]
+    fn step_editor_esc_returns_to_config() {
+        let mut s = step_editor_state(1);
+        press(&mut s, KeyCode::Esc);
+        assert_eq!(s.view, View::Config(0));
+    }
+
+    #[test]
+    fn key_capture_mode_only_accepts_esc() {
+        let mut s = step_editor_state(2);
+        s.inserting_key_step = true;
+
+        press(&mut s, KeyCode::Down);
+        assert!(s.inserting_key_step, "other keys are swallowed");
+        assert_eq!(s.selected_step, 0, "navigation does not leak through");
+
+        press(&mut s, KeyCode::Esc);
+        assert!(!s.inserting_key_step, "Esc cancels capture");
+    }
+
+    #[test]
+    fn insert_text_commits_after_the_selection() {
+        let mut s = step_editor_state(3);
+        s.selected_step = 0;
+        s.inserting_text = true;
+        s.insert_text_buf = "hi".into();
+
+        press(&mut s, KeyCode::Enter);
+
+        assert!(!s.inserting_text);
+        assert!(s.insert_text_buf.is_empty(), "buffer cleared on commit");
+        assert_eq!(s.macros[0].steps.len(), 4);
+        assert_eq!(s.selected_step, 1, "selection follows the inserted step");
+        match &s.macros[0].steps[1].action {
+            KeyAction::TypeText(t) => assert_eq!(t, "hi"),
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_text_esc_discards_the_buffer() {
+        let mut s = step_editor_state(2);
+        s.inserting_text = true;
+        s.insert_text_buf = "hi".into();
+
+        press(&mut s, KeyCode::Esc);
+
+        assert!(!s.inserting_text);
+        assert!(s.insert_text_buf.is_empty());
+        assert_eq!(s.macros[0].steps.len(), 2, "no step added");
+    }
+
+    #[test]
+    fn insert_text_empty_buffer_adds_nothing() {
+        let mut s = step_editor_state(2);
+        s.inserting_text = true;
+
+        press(&mut s, KeyCode::Enter);
+
+        assert_eq!(s.macros[0].steps.len(), 2);
+        assert!(!s.inserting_text);
+    }
+
+    #[test]
+    fn insert_text_typing_accumulates_into_the_buffer() {
+        let mut s = step_editor_state(1);
+        s.inserting_text = true;
+
+        press(&mut s, KeyCode::Char('a'));
+        press(&mut s, KeyCode::Char('b'));
+
+        assert_eq!(s.insert_text_buf, "ab", "the clone-mutate-write-back path");
+    }
+
+    #[test]
+    fn step_delay_edit_commits_a_parsed_value() {
+        let mut s = step_editor_state(2);
+        s.selected_step = 1;
+        s.editing_step_delay = true;
+        s.step_delay_buf = "250".into();
+
+        press(&mut s, KeyCode::Enter);
+
+        assert_eq!(s.macros[0].steps[1].delay_ms, 250);
+        assert!(!s.editing_step_delay);
+        assert!(s.step_delay_buf.is_empty());
+    }
+
+    #[test]
+    fn step_delay_edit_ignores_an_unparseable_value() {
+        let mut s = step_editor_state(1);
+        s.editing_step_delay = true;
+        s.step_delay_buf = "abc".into();
+
+        press(&mut s, KeyCode::Enter);
+
+        assert_eq!(s.macros[0].steps[0].delay_ms, 10, "original delay kept");
+        assert!(!s.editing_step_delay, "edit mode still exits");
+    }
+
+    #[test]
+    fn step_delay_edit_esc_leaves_the_step_alone() {
+        let mut s = step_editor_state(1);
+        s.editing_step_delay = true;
+        s.step_delay_buf = "999".into();
+
+        press(&mut s, KeyCode::Esc);
+
+        assert_eq!(s.macros[0].steps[0].delay_ms, 10);
+        assert!(s.step_delay_buf.is_empty());
+    }
+
+    #[test]
+    fn step_delay_edit_rejects_letters() {
+        let mut s = step_editor_state(1);
+        s.editing_step_delay = true;
+
+        press(&mut s, KeyCode::Char('7'));
+        press(&mut s, KeyCode::Char('x'));
+
+        assert_eq!(s.step_delay_buf, "7", "numeric field takes digits only");
+    }
+
+    #[test]
+    fn scroll_clicks_edit_updates_the_selected_scroll_step() {
+        let mut s = step_editor_state(0);
+        s.macros[0].steps.push(MacroStep {
+            action: KeyAction::MouseScroll(ScrollDirection::Up, 1),
+            delay_ms: 0,
+        });
+        s.editing_scroll_clicks = true;
+        s.scroll_clicks_buf = "5".into();
+
+        press(&mut s, KeyCode::Enter);
+
+        match s.macros[0].steps[0].action {
+            KeyAction::MouseScroll(_, clicks) => assert_eq!(clicks, 5),
+            ref other => panic!("unexpected action: {other:?}"),
+        }
+        assert!(!s.editing_scroll_clicks);
+    }
+
+    #[test]
+    fn scroll_clicks_edit_rejects_zero() {
+        let mut s = step_editor_state(0);
+        s.macros[0].steps.push(MacroStep {
+            action: KeyAction::MouseScroll(ScrollDirection::Up, 3),
+            delay_ms: 0,
+        });
+        s.editing_scroll_clicks = true;
+        s.scroll_clicks_buf = "0".into();
+
+        press(&mut s, KeyCode::Enter);
+
+        match s.macros[0].steps[0].action {
+            KeyAction::MouseScroll(_, clicks) => assert_eq!(clicks, 3, "zero is ignored"),
+            ref other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn modal_guards_take_priority_over_commands() {
+        // 'd' deletes a step in command mode, but must be swallowed as text
+        // while a modal input is open.
+        let mut s = step_editor_state(3);
+        s.inserting_text = true;
+
+        press(&mut s, KeyCode::Char('d'));
+
+        assert_eq!(s.macros[0].steps.len(), 3, "no step deleted");
+        assert_eq!(s.insert_text_buf, "d", "captured as text instead");
+    }
+
     #[test]
     fn wrap_nav_down() {
         let mut cur = 0;
