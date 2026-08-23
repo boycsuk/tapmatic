@@ -237,14 +237,11 @@ fn normal_scan(
 
     // A poisoned lock only means the UI thread panicked while holding it;
     // the data itself cannot be half-written, and silently returning here
-    // would disable every hotkey for the rest of the session.
-    let keys = config
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .bound_keys
-        .clone();
-
-    for (vk, mode) in &keys {
+    // would disable every hotkey for the rest of the session. Iterating
+    // under the lock beats cloning the Vec on every 10 ms poll: the sends
+    // are non-blocking.
+    let cfg = config.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (vk, mode) in &cfg.bound_keys {
         let vk = *vk;
         if !crate::macro_def::is_valid_vk(vk) {
             continue;

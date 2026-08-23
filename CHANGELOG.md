@@ -109,6 +109,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- The console title is rebuilt and written only when it changes, instead of
+  every frame; the fully static help view content is built once instead of
+  per frame.
+- A Global-mode macro bound to a process queried the foreground window on
+  every step (~100 syscall clusters/second at 10 ms intervals); the answer
+  is now cached for 75 ms. The hotkey scanner no longer clones the bound-key
+  list on every 10 ms poll.
 - Config writes no longer happen synchronously inside key handlers; changes are
   flushed at most once per second and on quit.
 - The foreground process is polled ~4 times per second rather than every frame.

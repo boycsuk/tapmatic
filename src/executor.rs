@@ -136,6 +136,16 @@ fn sleep_interruptible(ms: u64, stop_flag: &AtomicBool) -> bool {
     should_stop(stop_flag)
 }
 
+/// Poll `cond` every `poll_ms` until it holds or the macro is stopped.
+///
+/// Returns true when stopped, mirroring `sleep_interruptible`.
+fn wait_until(stop_flag: &AtomicBool, poll_ms: u64, cond: impl Fn() -> bool) -> bool {
+    while !should_stop(stop_flag) && !cond() {
+        thread::sleep(Duration::from_millis(poll_ms));
+    }
+    should_stop(stop_flag)
+}
+
 /// Keys and buttons pressed during execution, released on `Drop` so they are
 /// freed even when the step loop panics or the thread is unwound.
 struct HeldInputs {
@@ -231,6 +241,7 @@ fn execute_macro_inner(
 
     let window_mode = held.window_mode();
     let mut warned_blocked = false;
+    let mut focus_cache: Option<(Instant, bool)> = None;
 
     if mac.start_delay_ms > 0
         && sleep_interruptible(mac.start_delay_ms, stop_flag) {
@@ -243,25 +254,33 @@ fn execute_macro_inner(
                 return;
             }
 
-            if mac.require_held_vk != 0 && !input::is_key_pressed(mac.require_held_vk) {
-                while !should_stop(stop_flag) && !input::is_key_pressed(mac.require_held_vk) {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                if should_stop(stop_flag) {
-                    return;
-                }
+            if mac.require_held_vk != 0
+                && !input::is_key_pressed(mac.require_held_vk)
+                && wait_until(stop_flag, 10, || input::is_key_pressed(mac.require_held_vk))
+            {
+                return;
             }
 
             if !window_mode
-                && let Some(ref bound) = mac.bound_process
-                    && !is_bound_process_focused(bound) {
-                        while !should_stop(stop_flag) && !is_bound_process_focused(bound) {
-                            thread::sleep(Duration::from_millis(50));
+                && let Some(ref bound) = mac.bound_process {
+                    // The foreground window changes at human speed; querying
+                    // it for every step of a fast macro is ~100 syscall
+                    // clusters per second.
+                    let focused = match focus_cache {
+                        Some((at, val)) if at.elapsed() < FOCUS_RECHECK_INTERVAL => val,
+                        _ => {
+                            let val = is_bound_process_focused(bound);
+                            focus_cache = Some((Instant::now(), val));
+                            val
                         }
-                        if should_stop(stop_flag) {
+                    };
+                    if !focused {
+                        if wait_until(stop_flag, 50, || is_bound_process_focused(bound)) {
                             return;
                         }
+                        focus_cache = Some((Instant::now(), true));
                     }
+                }
 
             let raw_delay = if let Some((min, max)) = mac.random_delay {
                 random_delay_in_range(min, max, input::xorshift64(&mut rng_state))
@@ -294,15 +313,10 @@ fn execute_macro_inner(
 
             // Conditional steps — wait before proceeding
             if let KeyAction::WaitForWindow(ref name) = step.action {
-                while !should_stop(stop_flag) {
-                    if input::get_foreground_process_name()
-                        .is_some_and(|fg| fg == *name)
-                    {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(50));
+                let found = || input::get_foreground_process_name().is_some_and(|fg| fg == *name);
+                if wait_until(stop_flag, 50, found) {
+                    return;
                 }
-                if should_stop(stop_flag) { return; }
             } else if window_mode {
                 let process = mac.bound_process.as_deref().unwrap_or("");
                 while !input::execute_action_to_process(
@@ -375,6 +389,9 @@ fn execute_macro_inner(
         }
     }
 }
+
+/// How long a bound-process focus answer stays valid before re-querying.
+const FOCUS_RECHECK_INTERVAL: Duration = Duration::from_millis(75);
 
 fn is_bound_process_focused(bound: &str) -> bool {
     input::get_foreground_process_name()
