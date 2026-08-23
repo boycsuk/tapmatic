@@ -90,8 +90,13 @@ pub fn load() -> LoadOutcome {
         Ok(data) => data,
         Err(e) => return LoadOutcome::Corrupt(format!("could not read {}: {e}", path.display())),
     };
-    match serde_json::from_str(&data) {
-        Ok(config) => LoadOutcome::Loaded(config),
+    match serde_json::from_str::<AppConfig>(&data) {
+        Ok(mut config) => {
+            for mac in &mut config.macros {
+                mac.clamp_to_valid_ranges();
+            }
+            LoadOutcome::Loaded(config)
+        }
         Err(e) => LoadOutcome::Corrupt(format!("{} is not valid JSON: {e}", path.display())),
     }
 }
@@ -109,7 +114,10 @@ fn migrate_old_format() -> AppConfig {
     for candidate in candidates.into_iter().flatten() {
         if candidate.exists()
             && let Ok(data) = fs::read_to_string(&candidate)
-                && let Ok(macros) = serde_json::from_str::<Vec<Macro>>(&data) {
+                && let Ok(mut macros) = serde_json::from_str::<Vec<Macro>>(&data) {
+                    for mac in &mut macros {
+                        mac.clamp_to_valid_ranges();
+                    }
                     let config = AppConfig { macros, ..AppConfig::default() };
                     if save(&config).is_ok() {
                         let _ = fs::remove_file(&candidate);
