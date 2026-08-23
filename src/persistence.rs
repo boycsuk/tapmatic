@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::macro_def::{Macro, MAX_MACROS};
 
-const FILE_NAME: &str = ".tapmatic.json";
+pub const FILE_NAME: &str = ".tapmatic.json";
 
 /// Top-level config file: settings + macros in one file.
 #[derive(Serialize, Deserialize)]

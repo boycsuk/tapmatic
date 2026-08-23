@@ -357,17 +357,10 @@ fn draw_main(f: &mut Frame, state: &AppState) {
         f.render_stateful_widget(table, chunks[1], &mut table_state);
     }
 
-    let button_hint = match state.selected_button {
-        0 => "Start recording a new macro",
-        1 => "Edit selected macro settings",
-        2 => "Duplicate selected macro",
-        3 => "Delete selected macro",
-        4 => "Save settings and macros to ~/.tapmatic.json",
-        5 => "Enable/disable all macro hotkeys",
-        6 => "Toggle audio feedback",
-        7 => "Exit tapmatic",
-        _ => "",
-    };
+    let button_hint = crate::MAIN_BUTTON_HINTS
+        .get(state.selected_button)
+        .copied()
+        .unwrap_or("");
 
     let toolbar_block = Block::default()
         .borders(Borders::ALL)

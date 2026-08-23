@@ -45,6 +45,105 @@ pub enum ConfigField {
     HumanizeMs,
 }
 
+impl ConfigField {
+    /// Current value of this field on `mac`, as the text an edit buffer
+    /// should start from. Fields without a text form yield an empty string.
+    pub fn read(self, mac: &Macro) -> String {
+        match self {
+            Self::Name => mac.name.clone(),
+            Self::FixedInterval => mac.fixed_interval_ms.to_string(),
+            Self::RandomDelayMin => {
+                mac.random_delay.map_or(String::new(), |(min, _)| min.to_string())
+            }
+            Self::RandomDelayMax => {
+                mac.random_delay.map_or(String::new(), |(_, max)| max.to_string())
+            }
+            Self::StopValue => mac.stop_condition.value().map_or(String::new(), |n| n.to_string()),
+            Self::CycleDelay => mac.cycle_delay_ms.to_string(),
+            Self::StartDelay => mac.start_delay_ms.to_string(),
+            Self::MouseJitter => mac.mouse_jitter.to_string(),
+            Self::HumanizeMs => mac.humanize_ms.to_string(),
+            Self::ExclusiveGroup => mac.exclusive_group.clone().unwrap_or_default(),
+            Self::ChainMacro => mac.chain_macro.clone().unwrap_or_default(),
+            Self::BoundProcess => mac.bound_process.clone().unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    /// Apply edited text to this field on `mac`.
+    ///
+    /// Unparseable input leaves the field unchanged (revert-on-invalid); an
+    /// emptied optional field clears it.
+    pub fn write(self, mac: &mut Macro, input: &str) {
+        match self {
+            Self::Name if !input.is_empty() => mac.name = input.to_string(),
+            Self::FixedInterval => {
+                if let Ok(ms) = input.parse::<u64>()
+                    && ms > 0 {
+                        mac.fixed_interval_ms = ms;
+                    }
+            }
+            Self::RandomDelayMin => {
+                if let Ok(ms) = input.parse::<u64>() {
+                    let max = mac.random_delay.map_or(ms, |(_, mx)| mx);
+                    mac.random_delay = Some((ms, max.max(ms)));
+                } else if input.is_empty() {
+                    mac.random_delay = None;
+                }
+            }
+            Self::RandomDelayMax => {
+                if let Ok(ms) = input.parse::<u64>() {
+                    let min = mac.random_delay.map_or(0, |(mn, _)| mn);
+                    mac.random_delay = Some((min, ms.max(min)));
+                }
+            }
+            Self::StopValue => {
+                if let Ok(val) = input.parse::<u32>()
+                    && val > 0 {
+                        mac.stop_condition = mac.stop_condition.with_value(val);
+                    }
+            }
+            Self::CycleDelay => {
+                if let Ok(ms) = input.parse::<u64>() {
+                    mac.cycle_delay_ms = ms;
+                }
+            }
+            Self::StartDelay => {
+                if let Ok(ms) = input.parse::<u64>() {
+                    mac.start_delay_ms = ms;
+                }
+            }
+            Self::MouseJitter => {
+                if let Ok(px) = input.parse::<u32>() {
+                    mac.mouse_jitter = px;
+                }
+            }
+            Self::HumanizeMs => {
+                if let Ok(ms) = input.parse::<u64>() {
+                    mac.humanize_ms = ms;
+                }
+            }
+            Self::ExclusiveGroup | Self::ChainMacro | Self::BoundProcess => {
+                let val = input.trim().to_string();
+                let opt = if val.is_empty() {
+                    None
+                } else if self == Self::BoundProcess {
+                    Some(val.to_lowercase())
+                } else {
+                    Some(val)
+                };
+                match self {
+                    Self::ExclusiveGroup => mac.exclusive_group = opt,
+                    Self::ChainMacro => mac.chain_macro = opt,
+                    Self::BoundProcess => mac.bound_process = opt,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub const CONFIG_TAB_BASIC: &[ConfigField] = &[
     ConfigField::Name,
     ConfigField::Hotkey,
@@ -362,53 +461,36 @@ impl AppState {
     /// indexes the filtered list rather than `macros`.
     pub fn move_selection(&mut self, up: bool) {
         let count = self.filtered_macro_indices().len();
-        if count == 0 {
-            return;
-        }
-        if up {
-            self.selected_macro = if self.selected_macro > 0 { self.selected_macro - 1 } else { count - 1 };
-        } else {
-            self.selected_macro = if self.selected_macro + 1 < count { self.selected_macro + 1 } else { 0 };
-        }
+        wrap_nav(&mut self.selected_macro, count, up);
     }
 
     /// Insert a character at the cursor position.
     pub fn buf_insert(&mut self, buf: &mut String, c: char) {
-        let byte_pos = buf.char_indices().nth(self.text_cursor).map_or(buf.len(), |(i, _)| i);
-        buf.insert(byte_pos, c);
+        buf.insert(byte_index(buf, self.text_cursor), c);
         self.text_cursor += 1;
     }
 
     /// Delete the character before the cursor (Backspace).
     pub fn buf_backspace(&mut self, buf: &mut String) {
         if self.text_cursor > 0 {
-            let byte_pos = buf.char_indices().nth(self.text_cursor - 1).map(|(i, _)| i).unwrap_or(0);
-            buf.remove(byte_pos);
+            buf.remove(byte_index(buf, self.text_cursor - 1));
             self.text_cursor -= 1;
         }
     }
 
     /// Delete the character at the cursor (Delete key).
     pub fn buf_delete(&mut self, buf: &mut String) {
-        let len = buf.chars().count();
-        if self.text_cursor < len {
-            let byte_pos = buf.char_indices().nth(self.text_cursor).map(|(i, _)| i).unwrap_or(buf.len());
-            buf.remove(byte_pos);
+        if self.text_cursor < buf.chars().count() {
+            buf.remove(byte_index(buf, self.text_cursor));
         }
     }
 
     /// Delete the word before the cursor (Ctrl+Backspace).
     pub fn buf_backspace_word(&mut self, buf: &mut String) {
         if self.text_cursor == 0 { return; }
-        let chars: Vec<char> = buf.chars().collect();
-        let mut pos = self.text_cursor;
-        // Skip whitespace before cursor
-        while pos > 0 && chars[pos - 1] == ' ' { pos -= 1; }
-        // Skip word characters
-        while pos > 0 && chars[pos - 1] != ' ' { pos -= 1; }
-        // Remove from pos to cursor
-        let byte_start = buf.char_indices().nth(pos).map_or(buf.len(), |(i, _)| i);
-        let byte_end = buf.char_indices().nth(self.text_cursor).map_or(buf.len(), |(i, _)| i);
+        let pos = word_left_pos(buf, self.text_cursor);
+        let byte_start = byte_index(buf, pos);
+        let byte_end = byte_index(buf, self.text_cursor);
         buf.drain(byte_start..byte_end);
         self.text_cursor = pos;
     }
@@ -429,14 +511,7 @@ impl AppState {
 
     /// Move cursor to the start of the previous word (Ctrl+Left).
     pub fn buf_cursor_word_left(&mut self, buf: &str) {
-        if self.text_cursor == 0 { return; }
-        let chars: Vec<char> = buf.chars().collect();
-        let mut pos = self.text_cursor;
-        // Skip whitespace
-        while pos > 0 && chars[pos - 1] == ' ' { pos -= 1; }
-        // Skip word
-        while pos > 0 && chars[pos - 1] != ' ' { pos -= 1; }
-        self.text_cursor = pos;
+        self.text_cursor = word_left_pos(buf, self.text_cursor);
     }
 
     /// Move cursor to the end of the next word (Ctrl+Right).
@@ -444,9 +519,7 @@ impl AppState {
         let chars: Vec<char> = buf.chars().collect();
         let len = chars.len();
         let mut pos = self.text_cursor;
-        // Skip current word
         while pos < len && chars[pos] != ' ' { pos += 1; }
-        // Skip whitespace
         while pos < len && chars[pos] == ' ' { pos += 1; }
         self.text_cursor = pos;
     }
@@ -524,6 +597,33 @@ impl AppState {
         }
         self.selected_macro = 0;
     }
+}
+
+/// Move `current` one step through `count` items, wrapping at both ends.
+pub fn wrap_nav(current: &mut usize, count: usize, up: bool) {
+    if count == 0 {
+        return;
+    }
+    if up {
+        *current = if *current > 0 { *current - 1 } else { count - 1 };
+    } else {
+        *current = if *current + 1 < count { *current + 1 } else { 0 };
+    }
+}
+
+/// Byte offset of the `char_pos`-th character, or the buffer's end.
+fn byte_index(buf: &str, char_pos: usize) -> usize {
+    buf.char_indices().nth(char_pos).map_or(buf.len(), |(i, _)| i)
+}
+
+/// Character position of the start of the word before `from`: skips trailing
+/// spaces, then the word itself.
+fn word_left_pos(buf: &str, from: usize) -> usize {
+    let chars: Vec<char> = buf.chars().collect();
+    let mut pos = from;
+    while pos > 0 && chars[pos - 1] == ' ' { pos -= 1; }
+    while pos > 0 && chars[pos - 1] != ' ' { pos -= 1; }
+    pos
 }
 
 #[cfg(test)]
