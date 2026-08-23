@@ -42,18 +42,30 @@ pub fn executor_loop(rx: mpsc::Receiver<ExecutorCommand>, feedback_tx: mpsc::Sen
                     let flag_clone = Arc::clone(&stop_flag);
                     let fb_tx = feedback_tx.clone();
 
-                    let handle = thread::Builder::new()
+                    let spawned = thread::Builder::new()
                         .name(format!("macro-{}", vk))
                         .spawn(move || {
-                            execute_macro(&mac, &flag_clone, &fb_tx);
+                            let completed = execute_macro(&mac, &flag_clone, &fb_tx);
                             let _ = fb_tx.send(AppEvent::MacroFinished(vk));
-                            if let Some(ref chain_name) = mac.chain_macro {
-                                let _ = fb_tx.send(AppEvent::ChainMacro(chain_name.clone()));
-                            }
-                        })
-                        .ok();
+                            // Chaining an aborted macro would let a
+                            // self-chaining one restart forever with no way
+                            // to stop it.
+                            if completed
+                                && let Some(ref chain_name) = mac.chain_macro {
+                                    let _ = fb_tx.send(AppEvent::ChainMacro(chain_name.clone()));
+                                }
+                        });
 
-                    active.insert(vk, ActiveMacro { stop_flag, handle });
+                    match spawned {
+                        Ok(handle) => {
+                            active.insert(vk, ActiveMacro { stop_flag, handle: Some(handle) });
+                        }
+                        // The UI already marked the macro active; without this
+                        // event it would show as running forever.
+                        Err(_) => {
+                            let _ = feedback_tx.send(AppEvent::MacroFinished(vk));
+                        }
+                    }
                 }
                 ExecutorCommand::StopMacro(vk) => {
                     if let Some(existing) = active.remove(&vk) {
@@ -122,32 +134,81 @@ fn sleep_interruptible(ms: u64, stop_flag: &AtomicBool) -> bool {
     should_stop(stop_flag)
 }
 
-/// Release all keys and mouse buttons that were pressed during execution.
-fn release_all(pressed_keys: &HashSet<u16>, pressed_mouse: &HashSet<MouseButton>) {
-    for &sc in pressed_keys {
-        input::send_key(sc, true);
+/// Keys and buttons pressed during execution, released on `Drop` so they are
+/// freed even when the step loop panics or the thread is unwound.
+struct HeldInputs {
+    keys: HashSet<u16>,
+    mouse: HashSet<MouseButton>,
+    /// `Some(process)` when presses were posted to that process's window;
+    /// releasing must use the same channel, or the target never sees its
+    /// key-ups while whichever window has focus receives spurious ones.
+    window_process: Option<String>,
+    window_target: input::WindowTarget,
+}
+
+impl HeldInputs {
+    fn new(mac: &Macro) -> Self {
+        let window_process = (mac.send_mode == SendMode::Window)
+            .then(|| mac.bound_process.clone())
+            .flatten();
+        Self {
+            keys: HashSet::new(),
+            mouse: HashSet::new(),
+            window_process,
+            window_target: input::WindowTarget::new(),
+        }
     }
-    for &btn in pressed_mouse {
-        input::send_mouse(btn, true);
+
+    fn window_mode(&self) -> bool {
+        self.window_process.is_some()
     }
 }
 
-fn execute_macro(mac: &Macro, stop_flag: &AtomicBool, fb_tx: &mpsc::Sender<AppEvent>) {
-    let mut pressed_keys: HashSet<u16> = HashSet::new();
-    let mut pressed_mouse: HashSet<MouseButton> = HashSet::new();
+impl Drop for HeldInputs {
+    fn drop(&mut self) {
+        if let Some(process) = self.window_process.take() {
+            // A vanished target has nothing left to release; falling back to
+            // the global path would inject key-ups into the focused window.
+            for &sc in &self.keys {
+                input::execute_action_to_process(
+                    &KeyAction::KeyUp(sc),
+                    &process,
+                    &mut self.window_target,
+                );
+            }
+            for &btn in &self.mouse {
+                input::execute_action_to_process(
+                    &KeyAction::MouseUp(btn),
+                    &process,
+                    &mut self.window_target,
+                );
+            }
+        } else {
+            for &sc in &self.keys {
+                input::send_key(sc, true);
+            }
+            for &btn in &self.mouse {
+                input::send_mouse(btn, true);
+            }
+        }
+    }
+}
 
-    execute_macro_inner(mac, stop_flag, fb_tx, &mut pressed_keys, &mut pressed_mouse);
-
-    // Release any keys/buttons still held when macro stops
-    release_all(&pressed_keys, &pressed_mouse);
+/// Run a macro to completion, releasing held inputs on the way out.
+///
+/// Returns true when the macro finished on its own rather than being stopped
+/// or disabled.
+fn execute_macro(mac: &Macro, stop_flag: &AtomicBool, fb_tx: &mpsc::Sender<AppEvent>) -> bool {
+    let mut held = HeldInputs::new(mac);
+    execute_macro_inner(mac, stop_flag, fb_tx, &mut held);
+    !should_stop(stop_flag)
 }
 
 fn execute_macro_inner(
     mac: &Macro,
     stop_flag: &AtomicBool,
     fb_tx: &mpsc::Sender<AppEvent>,
-    pressed_keys: &mut HashSet<u16>,
-    pressed_mouse: &mut HashSet<MouseButton>,
+    held: &mut HeldInputs,
 ) {
     let is_single = mac.repetition == RepetitionMode::SingleShot;
     let start_time = Instant::now();
@@ -157,8 +218,7 @@ fn execute_macro_inner(
 
     let mut rng_state: u64 = start_time.elapsed().as_nanos() as u64 | 1;
 
-    let window_mode = mac.send_mode == SendMode::Window && mac.bound_process.is_some();
-    let mut window_target = input::WindowTarget::new();
+    let window_mode = held.window_mode();
 
     if mac.start_delay_ms > 0
         && sleep_interruptible(mac.start_delay_ms, stop_flag) {
@@ -219,10 +279,10 @@ fn execute_macro_inner(
                 }
 
             match &step.action {
-                KeyAction::KeyDown(sc) => { pressed_keys.insert(*sc); }
-                KeyAction::KeyUp(sc) => { pressed_keys.remove(sc); }
-                KeyAction::MouseDown(btn) => { pressed_mouse.insert(*btn); }
-                KeyAction::MouseUp(btn) => { pressed_mouse.remove(btn); }
+                KeyAction::KeyDown(sc) => { held.keys.insert(*sc); }
+                KeyAction::KeyUp(sc) => { held.keys.remove(sc); }
+                KeyAction::MouseDown(btn) => { held.mouse.insert(*btn); }
+                KeyAction::MouseUp(btn) => { held.mouse.remove(btn); }
                 _ => {}
             }
 
@@ -239,13 +299,14 @@ fn execute_macro_inner(
                 if should_stop(stop_flag) { return; }
             } else if window_mode {
                 let process = mac.bound_process.as_deref().unwrap_or("");
-                while !input::execute_action_to_process(&step.action, process, &mut window_target) {
+                while !input::execute_action_to_process(&step.action, process, &mut held.window_target)
+                {
                     if should_stop(stop_flag) {
                         return;
                     }
                     // The cached handle is already gone by now; drop it so the
                     // retry re-resolves instead of failing on a stale one.
-                    window_target.invalidate();
+                    held.window_target.invalidate();
                     thread::sleep(Duration::from_millis(50));
                 }
             } else if mac.mouse_jitter > 0 {
@@ -344,5 +405,55 @@ mod tests {
     fn humanize_extreme_value_does_not_overflow() {
         let d = apply_humanize(50, u64::MAX, 12345);
         assert!(d >= 1);
+    }
+
+    #[test]
+    fn apply_speed_scales_and_keeps_zero() {
+        assert_eq!(apply_speed(0), 0);
+        assert_eq!(apply_speed(100), 100, "default multiplier is 1.0");
+    }
+
+    fn instant_macro(reps: u32) -> Macro {
+        let mut mac = Macro::new("t".into());
+        mac.use_recorded_delays = false;
+        mac.fixed_interval_ms = 0;
+        mac.stop_condition = StopCondition::AfterReps(reps);
+        mac.steps.push(crate::macro_def::MacroStep {
+            action: KeyAction::KeyDown(30),
+            delay_ms: 0,
+        });
+        mac.steps.push(crate::macro_def::MacroStep {
+            action: KeyAction::KeyUp(30),
+            delay_ms: 0,
+        });
+        mac
+    }
+
+    #[test]
+    fn execute_macro_stops_after_exact_reps() {
+        let mac = instant_macro(3);
+        let (tx, rx) = mpsc::channel();
+        let flag = AtomicBool::new(false);
+
+        let completed = execute_macro(&mac, &flag, &tx);
+
+        assert!(completed, "AfterReps is a natural finish");
+        let reps: Vec<u32> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                AppEvent::MacroProgress(_, reps, _) => Some(reps),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reps.last(), Some(&3), "must stop at exactly 3 reps");
+    }
+
+    #[test]
+    fn execute_macro_reports_stop_as_not_completed() {
+        let mac = instant_macro(3);
+        let (tx, _rx) = mpsc::channel();
+        let flag = AtomicBool::new(true);
+
+        assert!(!execute_macro(&mac, &flag, &tx), "an aborted run must not chain");
     }
 }

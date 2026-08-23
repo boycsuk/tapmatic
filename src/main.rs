@@ -98,7 +98,7 @@ fn main() {
         .expect("failed to spawn hotkey thread");
 
     let exec_tx = event_tx.clone();
-    std::thread::Builder::new()
+    let executor_handle = std::thread::Builder::new()
         .name("executor".into())
         .spawn(move || executor::executor_loop(cmd_rx, exec_tx))
         .expect("failed to spawn executor thread");
@@ -113,8 +113,12 @@ fn main() {
     // run_app flushes on a clean quit; this covers the error path.
     flush_pending_save(&mut state);
 
-    RUNNING.store(false, Ordering::SeqCst);
+    // Stop and join the executor before dropping RUNNING: process exit kills
+    // the macro threads, so leaving before they release their held keys
+    // leaves those keys pressed system-wide.
     let _ = cmd_tx.send(ExecutorCommand::StopAll);
+    let _ = executor_handle.join();
+    RUNNING.store(false, Ordering::SeqCst);
     input::end_high_res_timer();
 
     if let Err(e) = result {
@@ -241,7 +245,10 @@ fn start_macro(
     let vk = mac.hotkey_vk;
     enforce_exclusive_group(state, &mac, cmd_tx);
     let _ = cmd_tx.send(ExecutorCommand::StartMacro(mac));
-    state.set_macro_active(vk, true);
+    // Chained macros may be unbound; vk 0 must not enter the active list.
+    if vk != 0 {
+        state.set_macro_active(vk, true);
+    }
     audio::play_activate();
 }
 
@@ -357,19 +364,15 @@ fn handle_app_event(
             audio::play_deactivate();
         }
         AppEvent::ChainMacro(name) => {
-            if let Some((_, mac)) = state
-                .macros
-                .iter()
-                .enumerate()
-                .find(|(_, m)| m.name == name)
-            {
+            if let Some(mac) = state.macros.iter().find(|m| m.name == name) {
                 let mac = mac.clone();
-                let vk = mac.hotkey_vk;
-                let _ = cmd_tx.send(ExecutorCommand::StartMacro(mac));
-                if vk != 0 {
-                    state.set_macro_active(vk, true);
+                // Chain starts obey the same gates as hotkey starts; an
+                // ungated restart would bypass the kill switch and process
+                // binding.
+                if macro_allowed(state, &mac) && !state.is_macro_active(mac.hotkey_vk) {
+                    start_macro(state, mac, cmd_tx);
+                    state.set_status(format!("Chained: {}", name));
                 }
-                state.set_status(format!("Chained: {}", name));
             }
         }
         AppEvent::QuickRecordToggle => {

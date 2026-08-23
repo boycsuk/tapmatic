@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overflow when scaled by `WHEEL_DELTA`), `MouseMove` coordinates (overflow
   when jittered), `WaitForWindow`, `bound_process`, `exclusive_group` and
   `chain_macro` strings, and the macro count itself.
+- Quitting with a macro mid-keypress left keys held system-wide: the quit
+  path dropped `RUNNING` before `StopAll` and never joined the executor, so
+  process exit killed the macro threads before they released anything. Held
+  inputs are now also released via `Drop`, so a panic in the step loop can no
+  longer skip the release.
+- Stopping a Window-mode macro released its keys through global `SendInput`
+  instead of the target window: the target kept a key logically held while
+  the focused window received spurious key-ups.
+- An aborted macro still fired its chain, so a self-chaining macro restarted
+  forever with no way to stop it — the kill switch included. Chain starts now
+  require a natural finish and obey the same gates as hotkey starts.
+- A macro thread that failed to spawn was reported as running forever.
 
 - Deleting a macro while a search filter was active removed a different macro
   than the highlighted one, and the confirmation prompt named the wrong macro.
