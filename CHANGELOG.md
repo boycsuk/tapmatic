@@ -36,6 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TypeText` slept 5 ms per character with no stop check: a full-length text
   blocked stop, quit and the executor loop for up to ~50 seconds. Typing now
   aborts when the macro is stopped.
+- The legacy migration read `macros.json` from the working directory, so
+  launching the binary in any directory containing one silently adopted its
+  macros and deleted the file. Only the executable's own directory is
+  searched now, and the migration refuses to overwrite a config that
+  appeared in the meantime.
+- The config search honoured `USERPROFILE` over `HOME` on Unix and fell back
+  to the working directory when neither was set; the fallback is now the
+  executable's directory, gated per platform.
+- The save temp file followed symlinks, was world-readable and was left
+  behind when the rename failed. It is now created fresh with owner-only
+  permissions (macros can hold typed text) and cleaned up on failure.
 
 - Deleting a macro while a search filter was active removed a different macro
   than the highlighted one, and the confirmation prompt named the wrong macro.
