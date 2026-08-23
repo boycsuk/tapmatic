@@ -1544,12 +1544,42 @@ mod tests {
     }
 
     #[test]
-    fn flush_is_a_noop_when_nothing_changed() {
+    fn flush_is_blocked_by_an_unreadable_config() {
         let mut s = AppState::new();
         s.config_read_failed = true;
         s.unsaved_changes = true;
         flush_pending_save(&mut s);
         assert!(s.unsaved_changes, "blocked config keeps the flag, writes nothing");
+    }
+
+    /// Both flush paths in one test: env vars are process-global, so two
+    /// parallel tests redirecting HOME would race each other.
+    #[test]
+    #[cfg(unix)]
+    fn flush_writes_on_success_and_reports_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tapmatic-flush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp home");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let mut s = AppState::new();
+        s.macros.push(Macro::new("flushed".into()));
+        s.unsaved_changes = true;
+        flush_pending_save(&mut s);
+        assert!(!s.unsaved_changes, "successful flush clears the dirty flag");
+        assert!(dir.join(".tapmatic.json").exists(), "config written to HOME");
+
+        // Err path: a read-only home makes the temp-file creation fail.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        s.unsaved_changes = true;
+        flush_pending_save(&mut s);
+        assert!(
+            s.status_message.as_ref().is_some_and(|(m, _, _)| m.contains("Save failed")),
+            "a failed save must be reported, not silently dropped"
+        );
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
     }
 
     //

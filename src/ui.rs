@@ -1138,3 +1138,67 @@ fn draw_help_tail(f: &mut Frame, state: &mut AppState, area: ratatui::layout::Re
         area,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::macro_def::{KeyAction, Macro, MacroStep};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn render(state: &mut AppState) {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| draw(f, state)).expect("draw");
+    }
+
+    fn populated() -> AppState {
+        let mut s = AppState::new();
+        let mut mac = Macro::new("smoke".into());
+        mac.hotkey_vk = 0x41;
+        mac.steps.push(MacroStep { action: KeyAction::KeyDown(30), delay_ms: 10 });
+        s.macros.push(mac);
+        s
+    }
+
+    #[test]
+    fn indexless_views_render_with_empty_and_populated_state() {
+        for view in [View::Main, View::Recording, View::Help] {
+            for populate in [false, true] {
+                let mut s = if populate { populated() } else { AppState::new() };
+                s.view = view.clone();
+                render(&mut s);
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_views_render_for_an_existing_macro() {
+        for view in [
+            View::Config(0),
+            View::StepEditor(0),
+            View::ProcessPicker(0),
+            View::ChainPicker(0),
+        ] {
+            let mut s = populated();
+            s.view = view.clone();
+            render(&mut s);
+        }
+    }
+
+    #[test]
+    fn step_editor_renders_a_macro_with_no_steps() {
+        let mut s = populated();
+        s.macros[0].steps.clear();
+        s.view = View::StepEditor(0);
+        render(&mut s);
+    }
+
+    #[test]
+    fn main_view_renders_a_filter_with_no_matches() {
+        let mut s = populated();
+        s.search_query = "no-match".into();
+        s.view = View::Main;
+        render(&mut s);
+    }
+}

@@ -99,10 +99,47 @@ mod tests {
     use std::time::Duration;
 
     fn recording_state() -> AppState {
-        let mut s = AppState::new();
-        s.recording_steps.clear();
-        s.recording_last_instant = None;
-        s
+        AppState::new()
+    }
+
+    #[test]
+    fn resume_after_pause_does_not_bake_in_the_pause_time() {
+        let mut s = recording_state();
+        let t0 = Instant::now();
+        process_record_event(&mut s, KeyAction::KeyDown(30), t0);
+        process_record_event(&mut s, KeyAction::KeyUp(30), t0 + Duration::from_millis(20));
+
+        toggle_pause(&mut s);
+        toggle_pause(&mut s);
+
+        // A long pause elapsed between the key-up and this event.
+        process_record_event(&mut s, KeyAction::KeyDown(31), t0 + Duration::from_secs(60));
+        assert_eq!(
+            s.recording_steps.last().unwrap().delay_ms,
+            0,
+            "the first post-resume event must not inherit the pause duration"
+        );
+    }
+
+    #[test]
+    fn events_while_paused_are_dropped() {
+        let mut s = recording_state();
+        toggle_pause(&mut s);
+        process_record_event(&mut s, KeyAction::KeyDown(30), Instant::now());
+        assert!(s.recording_steps.is_empty());
+    }
+
+    #[test]
+    fn stop_recording_drains_the_captured_steps() {
+        let mut s = recording_state();
+        crate::recorder::start_recording(&mut s);
+        process_record_event(&mut s, KeyAction::KeyDown(30), Instant::now());
+        let mac = stop_recording(&mut s);
+        assert_eq!(mac.steps.len(), 1);
+        assert!(s.recording_steps.is_empty(), "stop must drain the buffer");
+
+        let empty = stop_recording(&mut s);
+        assert!(empty.steps.is_empty(), "double stop yields an empty macro");
     }
 
     #[test]

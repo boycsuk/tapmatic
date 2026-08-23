@@ -94,6 +94,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The hotkey edge-detection logic is extracted into pure functions
   (previously it was welded to `GetAsyncKeyState`, untestable on any
   platform) and covered by an edge-table test suite.
+- Rendering smoke tests for every view (empty and populated state, empty
+  step list, filter with no matches) — `ui.rs` had no tests at all; recorder
+  pause-resume and drain tests; flush success/failure tests against a
+  temporary `HOME`; and two Windows-only tests exercised by the Windows CI
+  leg, which previously asserted nothing platform-specific.
 - Macro fields are validated and clamped when loaded, bounding virtual-key
   codes, delays, step counts and `TypeText` lengths at the untrusted-input
   boundary.

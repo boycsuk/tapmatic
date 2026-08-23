@@ -728,6 +728,25 @@ pub fn execute_action_to_process(
 mod tests {
     use super::*;
 
+    /// Runs only on the Windows CI leg — the half these APIs live in.
+    #[cfg(windows)]
+    #[test]
+    fn common_vks_map_to_nonzero_scancodes() {
+        // A wrong map type here means every recorded key silently drops
+        // (the recorder skips scancode 0).
+        for vk in [0x41, 0x30, 0x20, 0x0D] {
+            assert_ne!(vk_to_scancode(vk), 0, "vk {vk:#x} must map");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn window_target_starts_unresolved() {
+        let mut target = WindowTarget::default();
+        target.invalidate();
+        assert!(target.hwnd.is_none());
+    }
+
     #[test]
     fn cpu_percent_half_busy() {
         assert_eq!(calc_cpu_percent((0, 0), (100, 50)), 50);
