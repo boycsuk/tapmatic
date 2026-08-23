@@ -157,7 +157,7 @@ impl HeldInputs {
             keys: HashSet::new(),
             mouse: HashSet::new(),
             window_process,
-            window_target: input::WindowTarget::new(),
+            window_target: input::WindowTarget::default(),
         }
     }
 
@@ -230,6 +230,7 @@ fn execute_macro_inner(
         | 1;
 
     let window_mode = held.window_mode();
+    let mut warned_blocked = false;
 
     if mac.start_delay_ms > 0
         && sleep_interruptible(mac.start_delay_ms, stop_flag) {
@@ -318,15 +319,25 @@ fn execute_macro_inner(
                     held.window_target.invalidate();
                     thread::sleep(Duration::from_millis(50));
                 }
-            } else if mac.mouse_jitter > 0 {
-                input::execute_action_with_jitter(
-                    &step.action,
-                    mac.mouse_jitter,
-                    &mut rng_state,
-                    stop_flag,
-                );
             } else {
-                input::execute_action(&step.action, stop_flag);
+                let sent = if mac.mouse_jitter > 0 {
+                    input::execute_action_with_jitter(
+                        &step.action,
+                        mac.mouse_jitter,
+                        &mut rng_state,
+                        stop_flag,
+                    )
+                } else {
+                    input::execute_action(&step.action, stop_flag)
+                };
+                // UIPI or a secure desktop blocks injection silently; without
+                // this the macro "runs" while sending nothing.
+                if !sent && !warned_blocked {
+                    warned_blocked = true;
+                    let _ = fb_tx.send(AppEvent::Warning(
+                        "Input injection blocked (elevated target?)".into(),
+                    ));
+                }
             }
         }
 

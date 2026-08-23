@@ -103,6 +103,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI workflow building and linting on Linux and Windows. The Windows-only half
   of `input.rs` and `audio.rs` was never compiled by a Linux-only build.
 
+- `SendInput` return values were ignored at every call site, so a macro
+  blocked by UIPI or a secure desktop "ran" while sending nothing. Injection
+  failure now surfaces a one-shot status-bar warning per run.
+
 ### Performance
 
 - Config writes no longer happen synchronously inside key handlers; changes are
