@@ -18,6 +18,9 @@ const WHITE: Color = Color::White;
 const CYAN: Color = Color::Rgb(80, 220, 220);
 const ORANGE: Color = Color::Rgb(255, 160, 50);
 const BG_SELECTED: Color = Color::Rgb(40, 50, 70);
+const FG_TEXT: Color = Color::Rgb(200, 200, 200);
+const FG_TEXT_DIM: Color = Color::Rgb(180, 180, 180);
+const BG_ACTIVE_ROW: Color = Color::Rgb(180, 120, 40);
 
 pub fn draw(f: &mut Frame, state: &mut AppState) {
     match &state.view {
@@ -116,7 +119,7 @@ fn button_bar_line<'a>(buttons: &'a [&'a str], selected: usize) -> Line<'a> {
         } else {
             spans.push(Span::styled(
                 format!(" {} ", label),
-                Style::default().fg(Color::Rgb(180, 180, 180)),
+                Style::default().fg(FG_TEXT_DIM),
             ));
         }
         if i < buttons.len() - 1 {
@@ -124,6 +127,31 @@ fn button_bar_line<'a>(buttons: &'a [&'a str], selected: usize) -> Line<'a> {
         }
     }
     Line::from(spans)
+}
+
+/// Split the frame into a one-line status bar (rendered here) plus `body`
+/// constraints; the returned chunks index the body from 1.
+fn split_with_status_bar(
+    f: &mut Frame,
+    state: &AppState,
+    body: &[Constraint],
+) -> std::rc::Rc<[ratatui::layout::Rect]> {
+    let mut constraints = vec![Constraint::Length(1)];
+    constraints.extend_from_slice(body);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(f.area());
+    f.render_widget(Paragraph::new(status_bar(state)), chunks[0]);
+    chunks
+}
+
+/// Render a bordered one-line footer of spans into `area`.
+fn render_footer(f: &mut Frame, area: ratatui::layout::Rect, border: Style, spans: Vec<Span>) {
+    let block = Block::default().borders(Borders::ALL).border_style(border);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
 /// Format "N/M" position or a fallback for empty lists.
@@ -148,7 +176,7 @@ fn row_style(selected: bool) -> Style {
     if selected {
         Style::default().fg(WHITE).bg(BG_SELECTED).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Rgb(200, 200, 200))
+        Style::default().fg(FG_TEXT)
     }
 }
 
@@ -291,11 +319,9 @@ fn draw_main(f: &mut Frame, state: &AppState) {
                 };
 
                 let row_style = if active {
-                    Style::default().fg(Color::Black).bg(Color::Rgb(180, 120, 40)).add_modifier(Modifier::BOLD)
-                } else if selected {
-                    Style::default().fg(WHITE).bg(BG_SELECTED).add_modifier(Modifier::BOLD)
+                    Style::default().fg(Color::Black).bg(BG_ACTIVE_ROW).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Rgb(200, 200, 200))
+                    row_style(selected)
                 };
 
                 Row::new(vec![
@@ -305,7 +331,7 @@ fn draw_main(f: &mut Frame, state: &AppState) {
                     Cell::from(mode),
                     Cell::from(Span::styled(
                         delay,
-                        Style::default().fg(if mac.random_delay.is_some() { ORANGE } else { Color::Rgb(200, 200, 200) }),
+                        Style::default().fg(if mac.random_delay.is_some() { ORANGE } else { FG_TEXT }),
                     )),
                     Cell::from(Span::styled(
                         stop,
@@ -357,17 +383,10 @@ fn draw_main(f: &mut Frame, state: &AppState) {
         f.render_stateful_widget(table, chunks[1], &mut table_state);
     }
 
-    let button_hint = match state.selected_button {
-        0 => "Start recording a new macro",
-        1 => "Edit selected macro settings",
-        2 => "Duplicate selected macro",
-        3 => "Delete selected macro",
-        4 => "Save settings and macros to ~/.tapmatic.json",
-        5 => "Enable/disable all macro hotkeys",
-        6 => "Toggle audio feedback",
-        7 => "Exit tapmatic",
-        _ => "",
-    };
+    let button_hint = crate::MAIN_BUTTON_HINTS
+        .get(state.selected_button)
+        .copied()
+        .unwrap_or("");
 
     let toolbar_block = Block::default()
         .borders(Borders::ALL)
@@ -393,17 +412,7 @@ fn draw_main(f: &mut Frame, state: &AppState) {
 }
 
 fn draw_recording(f: &mut Frame, state: &AppState) {
-    let area = f.area();
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(5),
-        ])
-        .split(area);
-
-    f.render_widget(Paragraph::new(status_bar(state)), chunks[0]);
+    let chunks = split_with_status_bar(f, state, &[Constraint::Min(5)]);
 
     let step_count = state.recording_steps.len();
     let move_count = state.recording_steps.iter()
@@ -560,7 +569,7 @@ fn config_field_line(field: ConfigField, state: &AppState, mac: &Macro) -> Line<
     let (ls, vs) = if is_active {
         (Style::default().fg(YELLOW), Style::default().fg(WHITE).add_modifier(Modifier::BOLD))
     } else {
-        (Style::default().fg(GRAY), Style::default().fg(Color::Rgb(200, 200, 200)))
+        (Style::default().fg(GRAY), Style::default().fg(FG_TEXT))
     };
     let arrow = if is_active { ">" } else { " " };
 
@@ -663,19 +672,15 @@ fn config_field_line(field: ConfigField, state: &AppState, mac: &Macro) -> Line<
 }
 
 fn draw_config(f: &mut Frame, state: &AppState, idx: usize) {
-    let area = f.area();
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // status bar
+    let chunks = split_with_status_bar(
+        f,
+        state,
+        &[
             Constraint::Length(3), // tab bar
             Constraint::Min(5),    // config form
             Constraint::Length(3), // help
-        ])
-        .split(area);
-
-    f.render_widget(Paragraph::new(status_bar(state)), chunks[0]);
+        ],
+    );
 
     let mac = &state.macros[idx];
 
@@ -690,21 +695,11 @@ fn draw_config(f: &mut Frame, state: &AppState, idx: usize) {
     let tab_inner = tab_block.inner(chunks[1]);
     f.render_widget(tab_block, chunks[1]);
 
-    let mut tab_spans = Vec::new();
-    for (i, (name, _)) in crate::state::CONFIG_TABS.iter().enumerate() {
-        if i == state.config_tab {
-            tab_spans.push(Span::styled(
-                format!(" {} ", name),
-                Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            tab_spans.push(Span::styled(format!(" {} ", name), Style::default().fg(GRAY)));
-        }
-        if i < crate::state::CONFIG_TABS.len() - 1 {
-            tab_spans.push(Span::styled("\u{2502}", Style::default().fg(DIM)));
-        }
-    }
-    f.render_widget(Paragraph::new(Line::from(tab_spans)), tab_inner);
+    let tab_names: Vec<&str> = crate::state::CONFIG_TABS.iter().map(|(n, _)| *n).collect();
+    f.render_widget(
+        Paragraph::new(button_bar_line(&tab_names, state.config_tab)),
+        tab_inner,
+    );
 
     // Fields for current tab
     let tab_fields = crate::state::CONFIG_TABS[state.config_tab].1;
@@ -734,13 +729,6 @@ fn draw_config(f: &mut Frame, state: &AppState, idx: usize) {
 
     f.render_widget(Paragraph::new(content).block(form_block), chunks[2]);
 
-    // Help
-    let help_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(BORDER_STYLE);
-    let help_inner = help_block.inner(chunks[3]);
-    f.render_widget(help_block, chunks[3]);
-
     let mut spans = Vec::new();
     spans.extend(help_key("Up/Dn", "Fields", ACCENT));
     spans.extend(help_key("Tab", "Section", ACCENT));
@@ -749,22 +737,11 @@ fn draw_config(f: &mut Frame, state: &AppState, idx: usize) {
     spans.extend(help_key("F1", "Steps", ACCENT));
     spans.extend(help_key("F5", "Save", GREEN));
     spans.extend(help_key("Esc", "Cancel", RED));
-    f.render_widget(Paragraph::new(Line::from(spans)), help_inner);
+    render_footer(f, chunks[3], BORDER_STYLE, spans);
 }
 
 fn draw_step_editor(f: &mut Frame, state: &AppState, idx: usize) {
-    let area = f.area();
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(3), // help
-        ])
-        .split(area);
-
-    f.render_widget(Paragraph::new(status_bar(state)), chunks[0]);
+    let chunks = split_with_status_bar(f, state, &[Constraint::Min(3), Constraint::Length(3)]);
 
     let mac = &state.macros[idx];
     let total = mac.step_count();
@@ -844,13 +821,6 @@ fn draw_step_editor(f: &mut Frame, state: &AppState, idx: usize) {
     let mut table_state = TableState::default().with_selected(Some(state.selected_step));
     f.render_stateful_widget(table, chunks[1], &mut table_state);
 
-    // Help block
-    let bottom_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(DIM));
-    let bottom_inner = bottom_block.inner(chunks[2]);
-    f.render_widget(bottom_block, chunks[2]);
-
     let mut spans = Vec::new();
     if state.inserting_text {
         spans.push(Span::styled(
@@ -882,7 +852,7 @@ fn draw_step_editor(f: &mut Frame, state: &AppState, idx: usize) {
         spans.extend(help_key("d", "Del", RED));
         spans.extend(help_key("Esc", "Back", YELLOW));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), bottom_inner);
+    render_footer(f, chunks[2], Style::default().fg(DIM), spans);
 }
 
 /// Shared chrome for the picker views: status bar, bordered table and a
@@ -901,16 +871,7 @@ fn draw_list_picker(
     pos: String,
     footer: Vec<Span>,
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(3),
-        ])
-        .split(f.area());
-
-    f.render_widget(Paragraph::new(status_bar(state)), chunks[0]);
+    let chunks = split_with_status_bar(f, state, &[Constraint::Min(3), Constraint::Length(3)]);
 
     let table = Table::new(rows, widths.to_vec()).header(header).block(
         Block::default()
@@ -923,12 +884,7 @@ fn draw_list_picker(
     let mut table_state = TableState::default().with_selected(Some(selected));
     f.render_stateful_widget(table, chunks[1], &mut table_state);
 
-    let bottom_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style);
-    let bottom_inner = bottom_block.inner(chunks[2]);
-    f.render_widget(bottom_block, chunks[2]);
-    f.render_widget(Paragraph::new(Line::from(footer)), bottom_inner);
+    render_footer(f, chunks[2], border_style, footer);
 }
 
 fn draw_process_picker(f: &mut Frame, state: &AppState, _idx: usize) {
@@ -1013,6 +969,14 @@ fn draw_chain_picker(f: &mut Frame, state: &AppState, _idx: usize) {
 fn draw_help(f: &mut Frame, state: &mut AppState) {
     let area = f.area();
 
+    // The help text is fully static; rebuilding ~120 lines of spans every
+    // frame while the view is open is pure allocation churn.
+    static HELP_CONTENT: std::sync::OnceLock<Vec<Line<'static>>> = std::sync::OnceLock::new();
+    let content = HELP_CONTENT.get_or_init(build_help_content);
+    draw_help_tail(f, state, area, content);
+}
+
+fn build_help_content() -> Vec<Line<'static>> {
     let h = |title: &str| -> Line<'static> {
         Line::from(vec![Span::styled(
             format!("  {} ", title),
@@ -1029,7 +993,7 @@ fn draw_help(f: &mut Frame, state: &mut AppState) {
 
     let blank = || -> Line<'static> { Line::from("") };
 
-    let content = vec![
+    vec![
         blank(),
         Line::from(vec![Span::styled(
             "  tapmatic — Keyboard & Mouse Macro System",
@@ -1148,8 +1112,10 @@ fn draw_help(f: &mut Frame, state: &mut AppState) {
             Style::default().fg(GRAY),
         )]),
         blank(),
-    ];
+    ]
+}
 
+fn draw_help_tail(f: &mut Frame, state: &mut AppState, area: ratatui::layout::Rect, content: &[Line<'static>]) {
     let visible_height = area.height.saturating_sub(2) as usize;
     let max_scroll = content.len().saturating_sub(visible_height) as u16;
     state.help_scroll = state.help_scroll.min(max_scroll);
@@ -1166,9 +1132,73 @@ fn draw_help(f: &mut Frame, state: &mut AppState) {
         ]));
 
     f.render_widget(
-        Paragraph::new(content)
+        Paragraph::new(content.to_vec())
             .block(block)
             .scroll((state.help_scroll, 0)),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::macro_def::{KeyAction, Macro, MacroStep};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn render(state: &mut AppState) {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| draw(f, state)).expect("draw");
+    }
+
+    fn populated() -> AppState {
+        let mut s = AppState::new();
+        let mut mac = Macro::new("smoke".into());
+        mac.hotkey_vk = 0x41;
+        mac.steps.push(MacroStep { action: KeyAction::KeyDown(30), delay_ms: 10 });
+        s.macros.push(mac);
+        s
+    }
+
+    #[test]
+    fn indexless_views_render_with_empty_and_populated_state() {
+        for view in [View::Main, View::Recording, View::Help] {
+            for populate in [false, true] {
+                let mut s = if populate { populated() } else { AppState::new() };
+                s.view = view.clone();
+                render(&mut s);
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_views_render_for_an_existing_macro() {
+        for view in [
+            View::Config(0),
+            View::StepEditor(0),
+            View::ProcessPicker(0),
+            View::ChainPicker(0),
+        ] {
+            let mut s = populated();
+            s.view = view.clone();
+            render(&mut s);
+        }
+    }
+
+    #[test]
+    fn step_editor_renders_a_macro_with_no_steps() {
+        let mut s = populated();
+        s.macros[0].steps.clear();
+        s.view = View::StepEditor(0);
+        render(&mut s);
+    }
+
+    #[test]
+    fn main_view_renders_a_filter_with_no_matches() {
+        let mut s = populated();
+        s.search_query = "no-match".into();
+        s.view = View::Main;
+        render(&mut s);
+    }
 }

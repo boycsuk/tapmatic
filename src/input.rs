@@ -1,5 +1,9 @@
 use crate::macro_def::KeyAction;
 
+/// One mouse-wheel notch, as defined by the Windows WHEEL_DELTA constant.
+#[cfg(windows)]
+const WHEEL_DELTA: i32 = 120;
+
 // Only compiled on Windows. The non-Windows stubs below are no-ops that let
 // the crate build and the suite run off-Windows; no test exercising them
 // proves anything about real input behaviour.
@@ -8,11 +12,11 @@ use crate::macro_def::KeyAction;
 mod platform {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MapVirtualKeyA, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
-        KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAP_VIRTUAL_KEY_TYPE,
-        MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+        KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC,
+        MAP_VIRTUAL_KEY_TYPE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
         MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-        MOUSEINPUT, VIRTUAL_KEY,
+        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+        MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
     };
 
     use crate::macro_def::MouseButton;
@@ -23,12 +27,11 @@ mod platform {
     }
 
     pub fn vk_to_scancode(vk: i32) -> u16 {
-        unsafe { MapVirtualKeyA(vk as u32, MAP_VIRTUAL_KEY_TYPE(0)) as u16 }
+        unsafe { MapVirtualKeyA(vk as u32, MAP_VIRTUAL_KEY_TYPE(MAPVK_VK_TO_VSC.0)) as u16 }
     }
 
-    pub fn send_key(scancode: u16, up: bool) {
-        let flags = if up { KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP } else { KEYEVENTF_SCANCODE };
-        let input = INPUT {
+    pub(super) fn keyboard_input(scancode: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+        INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
@@ -39,13 +42,41 @@ mod platform {
                     dwExtraInfo: 0,
                 },
             },
-        };
-        unsafe {
-            SendInput(&[input], size_of::<INPUT>() as i32);
         }
     }
 
-    pub fn send_mouse(button: MouseButton, up: bool) {
+    fn mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
+        INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx,
+                    dy,
+                    mouseData: mouse_data,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+
+    /// Inject events, reporting whether all of them were accepted.
+    ///
+    /// SendInput returns the injected count: UIPI or a secure desktop can
+    /// block injection entirely, and ignoring that leaves a macro "running"
+    /// while sending nothing.
+    pub(super) fn send(inputs: &[INPUT]) -> bool {
+        let injected = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
+        injected as usize == inputs.len()
+    }
+
+    pub fn send_key(scancode: u16, up: bool) -> bool {
+        let flags = if up { KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP } else { KEYEVENTF_SCANCODE };
+        send(&[keyboard_input(scancode, flags)])
+    }
+
+    pub fn send_mouse(button: MouseButton, up: bool) -> bool {
         let flags = match (button, up) {
             (MouseButton::Left, false) => MOUSEEVENTF_LEFTDOWN,
             (MouseButton::Left, true) => MOUSEEVENTF_LEFTUP,
@@ -54,70 +85,29 @@ mod platform {
             (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEDOWN,
             (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEUP,
         };
-        let input = INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: 0,
-                    dy: 0,
-                    mouseData: 0,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
-        unsafe {
-            SendInput(&[input], size_of::<INPUT>() as i32);
-        }
+        send(&[mouse_input(0, 0, 0, flags)])
     }
 
-    pub fn send_mouse_scroll(up: bool, clicks: u32) {
-        // WHEEL_DELTA = 120; positive = scroll up, negative = scroll down
-        let delta = if up { 120i32 * clicks as i32 } else { -(120i32 * clicks as i32) };
-        let input = INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: 0,
-                    dy: 0,
-                    mouseData: delta as u32,
-                    dwFlags: MOUSEEVENTF_WHEEL,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
+    pub fn send_mouse_scroll(up: bool, clicks: u32) -> bool {
+        // Positive delta = scroll up, negative = scroll down.
+        let delta = if up {
+            crate::input::WHEEL_DELTA * clicks as i32
+        } else {
+            -(crate::input::WHEEL_DELTA * clicks as i32)
         };
-        unsafe {
-            SendInput(&[input], size_of::<INPUT>() as i32);
-        }
+        send(&[mouse_input(0, 0, delta as u32, MOUSEEVENTF_WHEEL)])
     }
 
-    pub fn send_mouse_move(x: i32, y: i32) {
+    pub fn send_mouse_move(x: i32, y: i32) -> bool {
         // Convert pixel coords to absolute (0..65535) normalized coords
         let (sx, sy) = unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
             (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
         };
-        if sx == 0 || sy == 0 { return; }
+        if sx == 0 || sy == 0 { return false; }
         let abs_x = ((x as i64 * 65536) / sx as i64) as i32;
         let abs_y = ((y as i64 * 65536) / sy as i64) as i32;
-        let input = INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: abs_x,
-                    dy: abs_y,
-                    mouseData: 0,
-                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
-        unsafe {
-            SendInput(&[input], size_of::<INPUT>() as i32);
-        }
+        send(&[mouse_input(abs_x, abs_y, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)])
     }
 
     pub fn get_cursor_pos() -> (i32, i32) {
@@ -129,7 +119,7 @@ mod platform {
     }
 
     /// Get the exe name (lowercase) of a process by PID.
-    fn exe_name_from_pid(pid: u32) -> Option<String> {
+    pub(super) fn exe_name_from_pid(pid: u32) -> Option<String> {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Threading::{
             OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
@@ -179,16 +169,19 @@ mod platform {
         }
     }
 
-    /// Find the main window HWND of a process by its exe name.
-    /// Returns the first visible window belonging to that process.
-    pub fn find_window_by_process(exe_name: &str) -> Option<windows::Win32::Foundation::HWND> {
-        use std::sync::Mutex as StdMutex;
+    /// Visit every visible top-level window with its owning exe name
+    /// (lowercase); return false from `f` to stop enumerating.
+    ///
+    /// EnumWindows invokes the callback synchronously on the calling thread,
+    /// so a plain closure reference through LPARAM is sound — no locking
+    /// needed.
+    fn for_each_visible_window(f: &mut dyn FnMut(windows::Win32::Foundation::HWND, &str) -> bool) {
         use windows::Win32::Foundation::{HWND, LPARAM};
         use windows::Win32::UI::WindowsAndMessaging::{
             EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
         };
 
-        let target = exe_name.to_lowercase();
+        type Visitor<'a> = &'a mut dyn FnMut(HWND, &str) -> bool;
 
         unsafe extern "system" fn callback(
             hwnd: HWND,
@@ -197,7 +190,6 @@ mod platform {
             unsafe {
                 use windows::core::BOOL;
                 let cont = BOOL(1);
-                let stop = BOOL(0);
 
                 if !IsWindowVisible(hwnd).as_bool() {
                     return cont;
@@ -213,23 +205,32 @@ mod platform {
                     return cont;
                 };
 
-                let data = &*(lparam.0 as *const (String, StdMutex<Option<HWND>>));
-                if name == data.0 {
-                    if let Ok(mut r) = data.1.lock() {
-                        *r = Some(hwnd);
-                    }
-                    return stop;
-                }
-                cont
+                let f = &mut *(lparam.0 as *mut Visitor);
+                BOOL(f(hwnd, &name) as i32)
             }
         }
 
-        let data = (target, StdMutex::new(None::<HWND>));
+        let mut visitor: Visitor = f;
         unsafe {
-            let ptr = &data as *const (String, StdMutex<Option<HWND>>);
+            let ptr = &mut visitor as *mut Visitor;
             let _ = EnumWindows(Some(callback), LPARAM(ptr as isize));
         }
-        data.1.into_inner().unwrap_or(None)
+    }
+
+    /// Find the main window HWND of a process by its exe name.
+    /// Returns the first visible window belonging to that process.
+    pub fn find_window_by_process(exe_name: &str) -> Option<windows::Win32::Foundation::HWND> {
+        let target = exe_name.to_lowercase();
+        let mut found = None;
+        for_each_visible_window(&mut |hwnd, name| {
+            if name == target {
+                found = Some(hwnd);
+                false
+            } else {
+                true
+            }
+        });
+        found
     }
 
     /// Send a key event to a specific window via PostMessage (no focus needed).
@@ -238,12 +239,17 @@ mod platform {
         use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
         use windows::Win32::Foundation::{WPARAM, LPARAM};
 
+        use windows::Win32::UI::Input::KeyboardAndMouse::MAPVK_VSC_TO_VK;
+        use windows::Win32::UI::WindowsAndMessaging::{WM_KEYDOWN, WM_KEYUP};
+
         unsafe {
-            let vk = MapVirtualKeyA(scancode as u32, MAP_VIRTUAL_KEY_TYPE(3)) as usize;
+            let vk = MapVirtualKeyA(scancode as u32, MAP_VIRTUAL_KEY_TYPE(MAPVK_VSC_TO_VK.0)) as usize;
+            // lParam: repeat count 1, scancode, and for key-up the
+            // previous-state and transition bits (30 and 31).
             let (msg, lparam) = if up {
-                (0x0101u32, 1u32 | ((scancode as u32) << 16) | 0xC000_0000)  // WM_KEYUP
+                (WM_KEYUP, 1u32 | ((scancode as u32) << 16) | 0xC000_0000)
             } else {
-                (0x0100u32, 1u32 | ((scancode as u32) << 16))                // WM_KEYDOWN
+                (WM_KEYDOWN, 1u32 | ((scancode as u32) << 16))
             };
             let _ = PostMessageW(Some(hwnd), msg, WPARAM(vk), LPARAM(lparam as isize));
         }
@@ -254,21 +260,24 @@ mod platform {
         use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
         use windows::Win32::Foundation::{WPARAM, LPARAM};
 
+        use windows::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_RBUTTONDOWN,
+            WM_RBUTTONUP,
+        };
+
         let msg = match (button, up) {
-            (MouseButton::Left, false) => 0x0201u32,   // WM_LBUTTONDOWN
-            (MouseButton::Left, true) => 0x0202u32,    // WM_LBUTTONUP
-            (MouseButton::Right, false) => 0x0204u32,  // WM_RBUTTONDOWN
-            (MouseButton::Right, true) => 0x0205u32,   // WM_RBUTTONUP
-            (MouseButton::Middle, false) => 0x0207u32, // WM_MBUTTONDOWN
-            (MouseButton::Middle, true) => 0x0208u32,  // WM_MBUTTONUP
+            (MouseButton::Left, false) => WM_LBUTTONDOWN,
+            (MouseButton::Left, true) => WM_LBUTTONUP,
+            (MouseButton::Right, false) => WM_RBUTTONDOWN,
+            (MouseButton::Right, true) => WM_RBUTTONUP,
+            (MouseButton::Middle, false) => WM_MBUTTONDOWN,
+            (MouseButton::Middle, true) => WM_MBUTTONUP,
         };
         unsafe {
             let _ = PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0));
         }
     }
 
-    /// Returns the executable name (e.g. "notepad.exe") of the foreground window,
-    /// or None if it can't be determined.
     /// Returns (total_time, idle_time) as raw ticks for CPU usage calculation.
     pub fn get_cpu_usage_snapshot() -> (u64, u64) {
         use windows::Win32::System::Threading::GetSystemTimes;
@@ -304,6 +313,8 @@ mod platform {
         (total_mb.saturating_sub(avail_mb), total_mb)
     }
 
+    /// Returns the executable name (e.g. "notepad.exe") of the foreground
+    /// window, or None if it can't be determined.
     pub fn get_foreground_process_name() -> Option<String> {
         use windows::Win32::UI::WindowsAndMessaging::{
             GetForegroundWindow, GetWindowThreadProcessId,
@@ -326,60 +337,23 @@ mod platform {
     /// Returns a list of (exe_name, window_title) for all visible windows with titles.
     pub fn get_window_list() -> Vec<(String, String)> {
         use std::collections::HashSet;
-        use std::sync::Mutex as StdMutex;
-        use windows::Win32::Foundation::{HWND, LPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::{
-            EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-            IsWindowVisible,
-        };
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
 
-        let results: StdMutex<Vec<(String, String)>> = StdMutex::new(Vec::new());
-
-        unsafe extern "system" fn enum_callback(
-            hwnd: HWND,
-            lparam: LPARAM,
-        ) -> windows::core::BOOL {
-            unsafe {
-                use windows::core::BOOL;
-                let cont = BOOL(1);
-                if !IsWindowVisible(hwnd).as_bool() {
-                    return cont;
-                }
-                let len = GetWindowTextLengthW(hwnd);
-                if len == 0 {
-                    return cont;
-                }
-                let mut title_buf = vec![0u16; (len + 1) as usize];
-                GetWindowTextW(hwnd, &mut title_buf);
-                let title = String::from_utf16_lossy(&title_buf[..len as usize]);
-                if title.is_empty() {
-                    return cont;
-                }
-
-                let mut pid: u32 = 0;
-                GetWindowThreadProcessId(hwnd, Some(&mut pid));
-                if pid == 0 {
-                    return cont;
-                }
-
-                let Some(exe_name) = super::platform::exe_name_from_pid(pid) else {
-                    return cont;
-                };
-
-                let list = &*(lparam.0 as *const StdMutex<Vec<(String, String)>>);
-                if let Ok(mut v) = list.lock() {
-                    v.push((exe_name, title));
-                }
-                cont
+        let mut list: Vec<(String, String)> = Vec::new();
+        for_each_visible_window(&mut |hwnd, exe_name| {
+            let len = unsafe { GetWindowTextLengthW(hwnd) };
+            if len == 0 {
+                return true;
             }
-        }
+            let mut title_buf = vec![0u16; (len + 1) as usize];
+            unsafe { GetWindowTextW(hwnd, &mut title_buf) };
+            let title = String::from_utf16_lossy(&title_buf[..len as usize]);
+            if !title.is_empty() {
+                list.push((exe_name.to_string(), title));
+            }
+            true
+        });
 
-        unsafe {
-            let ptr = &results as *const StdMutex<Vec<(String, String)>>;
-            let _ = EnumWindows(Some(enum_callback), LPARAM(ptr as isize));
-        }
-
-        let mut list = results.into_inner().unwrap_or_default();
         let mut seen = HashSet::new();
         list.retain(|(exe, _)| seen.insert(exe.clone()));
         list.sort_by(|a, b| a.0.cmp(&b.0));
@@ -398,10 +372,10 @@ mod platform {
     pub fn vk_to_scancode(_vk: i32) -> u16 {
         0
     }
-    pub fn send_key(_scancode: u16, _up: bool) {}
-    pub fn send_mouse(_button: MouseButton, _up: bool) {}
-    pub fn send_mouse_scroll(_up: bool, _clicks: u32) {}
-    pub fn send_mouse_move(_x: i32, _y: i32) {}
+    pub fn send_key(_scancode: u16, _up: bool) -> bool { true }
+    pub fn send_mouse(_button: MouseButton, _up: bool) -> bool { true }
+    pub fn send_mouse_scroll(_up: bool, _clicks: u32) -> bool { true }
+    pub fn send_mouse_move(_x: i32, _y: i32) -> bool { true }
     pub fn get_cursor_pos() -> (i32, i32) { (0, 0) }
     pub fn begin_high_res_timer() {}
     pub fn end_high_res_timer() {}
@@ -420,7 +394,6 @@ mod platform {
 
 }
 
-// Re-export platform functions
 pub use platform::*;
 
 /// Calculate CPU usage percentage from two snapshots.
@@ -467,7 +440,7 @@ mod scroll_hook {
                 let delta = (info.mouseData >> 16) as i16;
                 if delta != 0 {
                     let dir = if delta > 0 { ScrollDirection::Up } else { ScrollDirection::Down };
-                    let clicks = (delta.unsigned_abs() / 120).max(1) as u32;
+                    let clicks = (delta.unsigned_abs() / crate::input::WHEEL_DELTA as u16).max(1) as u32;
                     SCROLL_TX.with(|tx| {
                         if let Some(tx) = tx.borrow().as_ref() {
                             let _ = tx.send(AppEvent::RecordKey(
@@ -482,39 +455,61 @@ mod scroll_hook {
         }
     }
 
+    /// Install the low-level scroll hook on its own message-pump thread.
+    ///
+    /// Blocks until the thread has a message queue and has published its id:
+    /// a `stop()` racing the spawn would otherwise find no target, leaking
+    /// the hook and its thread for the rest of the process.
     pub fn start(tx: mpsc::Sender<AppEvent>) {
-        std::thread::Builder::new()
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_NOREMOVE};
+
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let spawned = std::thread::Builder::new()
             .name("scroll-hook".into())
             .spawn(move || {
                 unsafe {
+                    let warn_tx = tx.clone();
                     SCROLL_TX.with(|cell| {
                         *cell.borrow_mut() = Some(tx);
                     });
 
-                    let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0)
-                        .expect("failed to install mouse hook");
-
-                    // Store thread ID so we can post WM_QUIT to stop
+                    // The first PeekMessageW creates this thread's message
+                    // queue; only then is the published id postable.
+                    let mut msg = std::mem::zeroed();
+                    let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
                     let tid = windows::Win32::System::Threading::GetCurrentThreadId();
                     HOOK_THREAD_ID.store(tid as isize, Ordering::SeqCst);
+                    let _ = ready_tx.send(());
 
-                    // Message pump (required for low-level hooks)
-                    let mut msg = std::mem::zeroed();
-                    while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+                    let Ok(hook) = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0)
+                    else {
+                        // A panic here would only kill this detached thread,
+                        // silently losing scroll capture for the recording.
+                        HOOK_THREAD_ID.store(0, Ordering::SeqCst);
+                        let _ = warn_tx.send(AppEvent::Warning(
+                            "Scroll capture unavailable: mouse hook failed".into(),
+                        ));
+                        return;
+                    };
+
+                    // Message pump (required for low-level hooks); -1 means
+                    // error and must not keep the loop spinning.
+                    while GetMessageW(&mut msg, None, 0, 0).0 > 0 {}
 
                     let _ = UnhookWindowsHookEx(hook);
                 }
-            })
-            .expect("failed to spawn scroll hook thread");
+            });
+        if spawned.is_ok() {
+            let _ = ready_rx.recv();
+        }
     }
 
     pub fn stop() {
         let tid = HOOK_THREAD_ID.swap(0, Ordering::SeqCst);
         if tid != 0 {
             unsafe {
-                use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
-                // WM_QUIT = 0x0012
-                let _ = PostThreadMessageW(tid as u32, 0x0012, WPARAM(0), LPARAM(0));
+                use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+                let _ = PostThreadMessageW(tid as u32, WM_QUIT, WPARAM(0), LPARAM(0));
             }
         }
     }
@@ -533,7 +528,19 @@ pub use scroll_hook::start as start_scroll_hook;
 pub use scroll_hook::stop as stop_scroll_hook;
 
 /// Execute a single KeyAction via SendInput (global, needs focus).
-pub fn execute_action(action: &KeyAction) {
+/// Advance the xorshift64 state and return the new value.
+///
+/// `state` must be nonzero: zero is xorshift's fixed point.
+pub fn xorshift64(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// Execute a single KeyAction globally, reporting whether injection was
+/// accepted (see `platform::send`).
+pub fn execute_action(action: &KeyAction, stop: &std::sync::atomic::AtomicBool) -> bool {
     use crate::macro_def::ScrollDirection;
     match action {
         KeyAction::KeyDown(sc) => send_key(*sc, false),
@@ -542,73 +549,56 @@ pub fn execute_action(action: &KeyAction) {
         KeyAction::MouseUp(b) => send_mouse(*b, true),
         KeyAction::MouseScroll(dir, clicks) => send_mouse_scroll(*dir == ScrollDirection::Up, *clicks),
         KeyAction::MouseMove(x, y) => send_mouse_move(*x, *y),
-        KeyAction::TypeText(text) => type_text(text),
-        KeyAction::WaitForWindow(_) => {} // handled by executor
+        KeyAction::TypeText(text) => type_text(text, stop),
+        KeyAction::WaitForWindow(_) => true, // handled by executor
     }
 }
 
 /// Execute a MouseMove with jitter applied.
-pub fn execute_action_with_jitter(action: &KeyAction, jitter: u32, rng: &mut u64) {
+pub fn execute_action_with_jitter(
+    action: &KeyAction,
+    jitter: u32,
+    rng: &mut u64,
+    stop: &std::sync::atomic::AtomicBool,
+) -> bool {
     if jitter > 0
         && let KeyAction::MouseMove(x, y) = action {
-            // xorshift64 for offset
-            *rng ^= *rng << 13;
-            *rng ^= *rng >> 7;
-            *rng ^= *rng << 17;
             let jitter_i = jitter as i32;
-            let dx = (*rng as i32 % (jitter_i * 2 + 1)) - jitter_i;
-            *rng ^= *rng << 13;
-            *rng ^= *rng >> 7;
-            *rng ^= *rng << 17;
-            let dy = (*rng as i32 % (jitter_i * 2 + 1)) - jitter_i;
-            send_mouse_move(x + dx, y + dy);
-            return;
+            let dx = (xorshift64(rng) as i32 % (jitter_i * 2 + 1)) - jitter_i;
+            let dy = (xorshift64(rng) as i32 % (jitter_i * 2 + 1)) - jitter_i;
+            return send_mouse_move(x + dx, y + dy);
         }
-    execute_action(action);
+    execute_action(action, stop)
 }
 
 /// Type a string by sending key events for each character.
+///
+/// Checks `stop` between characters: a full-length text takes ~50 s, and an
+/// uninterruptible loop here blocks the executor's stop/join for that long.
 #[cfg(windows)]
-fn type_text(text: &str) {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-        KEYEVENTF_UNICODE, VIRTUAL_KEY,
-    };
+fn type_text(text: &str, stop: &std::sync::atomic::AtomicBool) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, KEYEVENTF_UNICODE};
 
+    let mut all_sent = true;
     for ch in text.encode_utf16() {
-        let down = INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(0),
-                    wScan: ch,
-                    dwFlags: KEYEVENTF_UNICODE,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
-        let up = INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(0),
-                    wScan: ch,
-                    dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
-        unsafe {
-            SendInput(&[down, up], size_of::<INPUT>() as i32);
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        let down = platform::keyboard_input(ch, KEYEVENTF_UNICODE);
+        let up = platform::keyboard_input(ch, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+        all_sent &= platform::send(&[down, up]);
+        std::thread::sleep(std::time::Duration::from_millis(TYPE_TEXT_CHAR_DELAY_MS));
     }
+    all_sent
 }
 
+#[cfg(windows)]
+const TYPE_TEXT_CHAR_DELAY_MS: u64 = 5;
+
 #[cfg(not(windows))]
-fn type_text(_text: &str) {}
+fn type_text(_text: &str, _stop: &std::sync::atomic::AtomicBool) -> bool {
+    true
+}
 
 /// A window handle resolved once and reused across a macro's steps.
 ///
@@ -618,30 +608,39 @@ fn type_text(_text: &str) {}
 #[derive(Default)]
 pub struct WindowTarget {
     hwnd: Option<windows::Win32::Foundation::HWND>,
+    /// Windows recycles HWND values, so `IsWindow` alone can validate a
+    /// handle that now belongs to a different program; ownership is
+    /// re-verified on a coarse interval.
+    last_identity_check: Option<std::time::Instant>,
 }
 
 #[cfg(not(windows))]
 #[derive(Default)]
-pub struct WindowTarget;
+pub struct WindowTarget {}
 
 impl WindowTarget {
-    #[cfg(windows)]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[cfg(not(windows))]
-    pub fn new() -> Self {
-        Self
-    }
 
     /// Drop the cached handle so the next send re-resolves it.
     pub fn invalidate(&mut self) {
         #[cfg(windows)]
         {
             self.hwnd = None;
+            self.last_identity_check = None;
         }
     }
+}
+
+#[cfg(windows)]
+const IDENTITY_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[cfg(windows)]
+fn window_belongs_to_process(hwnd: windows::Win32::Foundation::HWND, process: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    pid != 0
+        && platform::exe_name_from_pid(pid).is_some_and(|name| name == process.to_lowercase())
 }
 
 /// Execute a single KeyAction via PostMessage to a specific process window.
@@ -652,6 +651,7 @@ pub fn execute_action_to_process(
     action: &KeyAction,
     process: &str,
     target: &mut WindowTarget,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> bool {
     #[cfg(windows)]
     {
@@ -664,6 +664,18 @@ pub fn execute_action_to_process(
                 target.hwnd = None;
             }
 
+        if let Some(hwnd) = target.hwnd
+            && target
+                .last_identity_check
+                .is_none_or(|at| at.elapsed() >= IDENTITY_RECHECK_INTERVAL)
+        {
+            if window_belongs_to_process(hwnd, process) {
+                target.last_identity_check = Some(std::time::Instant::now());
+            } else {
+                target.hwnd = None;
+            }
+        }
+
         let hwnd = match target.hwnd {
             Some(hwnd) => hwnd,
             None => {
@@ -671,6 +683,7 @@ pub fn execute_action_to_process(
                     return false;
                 };
                 target.hwnd = Some(found);
+                target.last_identity_check = Some(std::time::Instant::now());
                 found
             }
         };
@@ -689,13 +702,16 @@ pub fn execute_action_to_process(
             KeyAction::MouseMove(x, y) => send_mouse_move(*x, *y),
             KeyAction::WaitForWindow(_) => {} // handled by executor
             KeyAction::TypeText(text) => {
-                use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+                use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR};
                 use windows::Win32::Foundation::{WPARAM, LPARAM};
                 for ch in text.encode_utf16() {
-                    unsafe {
-                        let _ = PostMessageW(Some(hwnd), 0x0102, WPARAM(ch as usize), LPARAM(0));
+                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    unsafe {
+                        let _ = PostMessageW(Some(hwnd), WM_CHAR, WPARAM(ch as usize), LPARAM(0));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(TYPE_TEXT_CHAR_DELAY_MS));
                 }
             }
         }
@@ -703,7 +719,7 @@ pub fn execute_action_to_process(
     }
     #[cfg(not(windows))]
     {
-        let _ = (action, process, target);
+        let _ = (action, process, target, stop);
         false
     }
 }
@@ -711,6 +727,25 @@ pub fn execute_action_to_process(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs only on the Windows CI leg — the half these APIs live in.
+    #[cfg(windows)]
+    #[test]
+    fn common_vks_map_to_nonzero_scancodes() {
+        // A wrong map type here means every recorded key silently drops
+        // (the recorder skips scancode 0).
+        for vk in [0x41, 0x30, 0x20, 0x0D] {
+            assert_ne!(vk_to_scancode(vk), 0, "vk {vk:#x} must map");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn window_target_starts_unresolved() {
+        let mut target = WindowTarget::default();
+        target.invalidate();
+        assert!(target.hwnd.is_none());
+    }
 
     #[test]
     fn cpu_percent_half_busy() {

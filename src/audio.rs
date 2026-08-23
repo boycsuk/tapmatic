@@ -22,6 +22,14 @@ mod platform {
         AUDIO_ENABLED.load(Ordering::SeqCst)
     }
 
+    /// A sine tone with the shared duration/volume/fade-in shaping.
+    fn sine(freq: f32, ms: u64, vol: f32) -> impl Source<Item = f32> {
+        rodio::source::SineWave::new(freq)
+            .take_duration(Duration::from_millis(ms))
+            .amplify(vol)
+            .fade_in(Duration::from_millis((ms / 4).max(5)))
+    }
+
     /// Play a sequence of notes. Each note is (frequency_hz, duration_ms).
     fn play_notes(notes: &[(f32, u64)], vol: f32) {
         if !is_enabled() {
@@ -35,11 +43,7 @@ mod platform {
             handle.log_on_drop(false);
             let mixer = handle.mixer();
             for (freq, ms) in &notes {
-                let source = rodio::source::SineWave::new(*freq)
-                    .take_duration(Duration::from_millis(*ms))
-                    .amplify(vol)
-                    .fade_in(Duration::from_millis((*ms / 4).max(5)));
-                mixer.add(source);
+                mixer.add(sine(*freq, *ms, vol));
                 std::thread::sleep(Duration::from_millis(*ms));
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -60,11 +64,7 @@ mod platform {
             let mixer = handle.mixer();
             let per_voice = vol / freqs.len().max(1) as f32;
             for freq in &freqs {
-                let source = rodio::source::SineWave::new(*freq)
-                    .take_duration(Duration::from_millis(ms))
-                    .amplify(per_voice)
-                    .fade_in(Duration::from_millis((ms / 4).max(5)));
-                mixer.add(source);
+                mixer.add(sine(*freq, ms, per_voice));
             }
             std::thread::sleep(Duration::from_millis(ms + 50));
         });

@@ -25,6 +25,10 @@ impl ActiveMacro {
     }
 }
 
+/// Own the running macros: spawn a thread per started macro, stop and join
+/// them on command, and exit after draining a `StopAll`.
+///
+/// Runs on its own thread until `RUNNING` drops or the channel closes.
 pub fn executor_loop(rx: mpsc::Receiver<ExecutorCommand>, feedback_tx: mpsc::Sender<AppEvent>) {
     let mut active: HashMap<i32, ActiveMacro> = HashMap::new();
 
@@ -42,18 +46,32 @@ pub fn executor_loop(rx: mpsc::Receiver<ExecutorCommand>, feedback_tx: mpsc::Sen
                     let flag_clone = Arc::clone(&stop_flag);
                     let fb_tx = feedback_tx.clone();
 
-                    let handle = thread::Builder::new()
+                    let spawned = thread::Builder::new()
                         .name(format!("macro-{}", vk))
                         .spawn(move || {
-                            execute_macro(&mac, &flag_clone, &fb_tx);
+                            let completed = execute_macro(&mac, &flag_clone, &fb_tx);
                             let _ = fb_tx.send(AppEvent::MacroFinished(vk));
-                            if let Some(ref chain_name) = mac.chain_macro {
-                                let _ = fb_tx.send(AppEvent::ChainMacro(chain_name.clone()));
-                            }
-                        })
-                        .ok();
+                            // Chaining an aborted macro would let a
+                            // self-chaining one restart forever with no way
+                            // to stop it.
+                            if completed
+                                && let Some(ref chain_name) = mac.chain_macro {
+                                    let _ = fb_tx.send(AppEvent::ChainMacro(chain_name.clone()));
+                                }
+                        });
 
-                    active.insert(vk, ActiveMacro { stop_flag, handle });
+                    match spawned {
+                        Ok(handle) => {
+                            active.insert(vk, ActiveMacro { stop_flag, handle: Some(handle) });
+                        }
+                        // The UI already marked the macro active; without this
+                        // event it would show as running forever.
+                        Err(e) => {
+                            let _ = feedback_tx.send(AppEvent::MacroFinished(vk));
+                            let _ = feedback_tx
+                                .send(AppEvent::Warning(format!("Could not start macro: {e}")));
+                        }
+                    }
                 }
                 ExecutorCommand::StopMacro(vk) => {
                     if let Some(existing) = active.remove(&vk) {
@@ -100,7 +118,8 @@ fn random_delay_in_range(min: u64, max: u64, rng_state: u64) -> u64 {
     }
 }
 
-/// Offset `raw_delay` by up to ±`humanize_ms`, with a floor of 1ms.
+/// Offset a nonzero `raw_delay` by up to ±`humanize_ms`, flooring at 1ms;
+/// a zero delay is returned unchanged.
 ///
 /// Saturates the span so an out-of-range `humanize_ms` cannot overflow.
 fn apply_humanize(raw_delay: u64, humanize_ms: u64, rng_state: u64) -> u64 {
@@ -122,32 +141,94 @@ fn sleep_interruptible(ms: u64, stop_flag: &AtomicBool) -> bool {
     should_stop(stop_flag)
 }
 
-/// Release all keys and mouse buttons that were pressed during execution.
-fn release_all(pressed_keys: &HashSet<u16>, pressed_mouse: &HashSet<MouseButton>) {
-    for &sc in pressed_keys {
-        input::send_key(sc, true);
+/// Poll `cond` every `poll_ms` until it holds or the macro is stopped.
+///
+/// Returns true when stopped, mirroring `sleep_interruptible`.
+fn wait_until(stop_flag: &AtomicBool, poll_ms: u64, cond: impl Fn() -> bool) -> bool {
+    while !should_stop(stop_flag) && !cond() {
+        thread::sleep(Duration::from_millis(poll_ms));
     }
-    for &btn in pressed_mouse {
-        input::send_mouse(btn, true);
+    should_stop(stop_flag)
+}
+
+/// Keys and buttons pressed during execution, released on `Drop` so they are
+/// freed even when the step loop panics or the thread is unwound.
+struct HeldInputs {
+    keys: HashSet<u16>,
+    mouse: HashSet<MouseButton>,
+    /// `Some(process)` when presses were posted to that process's window;
+    /// releasing must use the same channel, or the target never sees its
+    /// key-ups while whichever window has focus receives spurious ones.
+    window_process: Option<String>,
+    window_target: input::WindowTarget,
+}
+
+impl HeldInputs {
+    fn new(mac: &Macro) -> Self {
+        let window_process = (mac.send_mode == SendMode::Window)
+            .then(|| mac.bound_process.clone())
+            .flatten();
+        Self {
+            keys: HashSet::new(),
+            mouse: HashSet::new(),
+            window_process,
+            window_target: input::WindowTarget::default(),
+        }
+    }
+
+    fn window_mode(&self) -> bool {
+        self.window_process.is_some()
     }
 }
 
-fn execute_macro(mac: &Macro, stop_flag: &AtomicBool, fb_tx: &mpsc::Sender<AppEvent>) {
-    let mut pressed_keys: HashSet<u16> = HashSet::new();
-    let mut pressed_mouse: HashSet<MouseButton> = HashSet::new();
+impl Drop for HeldInputs {
+    fn drop(&mut self) {
+        if let Some(process) = self.window_process.take() {
+            // A vanished target has nothing left to release; falling back to
+            // the global path would inject key-ups into the focused window.
+            let never_stop = AtomicBool::new(false);
+            for &sc in &self.keys {
+                input::execute_action_to_process(
+                    &KeyAction::KeyUp(sc),
+                    &process,
+                    &mut self.window_target,
+                    &never_stop,
+                );
+            }
+            for &btn in &self.mouse {
+                input::execute_action_to_process(
+                    &KeyAction::MouseUp(btn),
+                    &process,
+                    &mut self.window_target,
+                    &never_stop,
+                );
+            }
+        } else {
+            for &sc in &self.keys {
+                input::send_key(sc, true);
+            }
+            for &btn in &self.mouse {
+                input::send_mouse(btn, true);
+            }
+        }
+    }
+}
 
-    execute_macro_inner(mac, stop_flag, fb_tx, &mut pressed_keys, &mut pressed_mouse);
-
-    // Release any keys/buttons still held when macro stops
-    release_all(&pressed_keys, &pressed_mouse);
+/// Run a macro to completion, releasing held inputs on the way out.
+///
+/// Returns true when the macro finished on its own rather than being stopped
+/// or disabled.
+fn execute_macro(mac: &Macro, stop_flag: &AtomicBool, fb_tx: &mpsc::Sender<AppEvent>) -> bool {
+    let mut held = HeldInputs::new(mac);
+    execute_macro_inner(mac, stop_flag, fb_tx, &mut held);
+    !should_stop(stop_flag)
 }
 
 fn execute_macro_inner(
     mac: &Macro,
     stop_flag: &AtomicBool,
     fb_tx: &mpsc::Sender<AppEvent>,
-    pressed_keys: &mut HashSet<u16>,
-    pressed_mouse: &mut HashSet<MouseButton>,
+    held: &mut HeldInputs,
 ) {
     let is_single = mac.repetition == RepetitionMode::SingleShot;
     let start_time = Instant::now();
@@ -155,10 +236,17 @@ fn execute_macro_inner(
     let mut last_progress_secs: u32 = u32::MAX;
     let vk = mac.hotkey_vk;
 
-    let mut rng_state: u64 = start_time.elapsed().as_nanos() as u64 | 1;
+    // Seeding from `start_time.elapsed()` here would yield a near-constant
+    // value, making every run's "random" delays identical.
+    let mut rng_state: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+        ^ (vk as u64) << 32
+        | 1;
 
-    let window_mode = mac.send_mode == SendMode::Window && mac.bound_process.is_some();
-    let mut window_target = input::WindowTarget::new();
+    let window_mode = held.window_mode();
+    let mut warned_blocked = false;
+    let mut focus_cache: Option<(Instant, bool)> = None;
 
     if mac.start_delay_ms > 0
         && sleep_interruptible(mac.start_delay_ms, stop_flag) {
@@ -171,31 +259,36 @@ fn execute_macro_inner(
                 return;
             }
 
-            if mac.require_held_vk != 0 && !input::is_key_pressed(mac.require_held_vk) {
-                while !should_stop(stop_flag) && !input::is_key_pressed(mac.require_held_vk) {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                if should_stop(stop_flag) {
-                    return;
-                }
+            if mac.require_held_vk != 0
+                && !input::is_key_pressed(mac.require_held_vk)
+                && wait_until(stop_flag, 10, || input::is_key_pressed(mac.require_held_vk))
+            {
+                return;
             }
 
             if !window_mode
-                && let Some(ref bound) = mac.bound_process
-                    && !is_bound_process_focused(bound) {
-                        while !should_stop(stop_flag) && !is_bound_process_focused(bound) {
-                            thread::sleep(Duration::from_millis(50));
+                && let Some(ref bound) = mac.bound_process {
+                    // The foreground window changes at human speed; querying
+                    // it for every step of a fast macro is ~100 syscall
+                    // clusters per second.
+                    let focused = match focus_cache {
+                        Some((at, val)) if at.elapsed() < FOCUS_RECHECK_INTERVAL => val,
+                        _ => {
+                            let val = is_bound_process_focused(bound);
+                            focus_cache = Some((Instant::now(), val));
+                            val
                         }
-                        if should_stop(stop_flag) {
+                    };
+                    if !focused {
+                        if wait_until(stop_flag, 50, || is_bound_process_focused(bound)) {
                             return;
                         }
+                        focus_cache = Some((Instant::now(), true));
                     }
+                }
 
             let raw_delay = if let Some((min, max)) = mac.random_delay {
-                rng_state ^= rng_state << 13;
-                rng_state ^= rng_state >> 7;
-                rng_state ^= rng_state << 17;
-                random_delay_in_range(min, max, rng_state)
+                random_delay_in_range(min, max, input::xorshift64(&mut rng_state))
             } else if mac.use_recorded_delays {
                 step.delay_ms
             } else {
@@ -203,10 +296,7 @@ fn execute_macro_inner(
             };
 
             let humanized = if mac.humanize_ms > 0 && raw_delay > 0 {
-                rng_state ^= rng_state << 13;
-                rng_state ^= rng_state >> 7;
-                rng_state ^= rng_state << 17;
-                apply_humanize(raw_delay, mac.humanize_ms, rng_state)
+                apply_humanize(raw_delay, mac.humanize_ms, input::xorshift64(&mut rng_state))
             } else {
                 raw_delay
             };
@@ -219,39 +309,54 @@ fn execute_macro_inner(
                 }
 
             match &step.action {
-                KeyAction::KeyDown(sc) => { pressed_keys.insert(*sc); }
-                KeyAction::KeyUp(sc) => { pressed_keys.remove(sc); }
-                KeyAction::MouseDown(btn) => { pressed_mouse.insert(*btn); }
-                KeyAction::MouseUp(btn) => { pressed_mouse.remove(btn); }
+                KeyAction::KeyDown(sc) => { held.keys.insert(*sc); }
+                KeyAction::KeyUp(sc) => { held.keys.remove(sc); }
+                KeyAction::MouseDown(btn) => { held.mouse.insert(*btn); }
+                KeyAction::MouseUp(btn) => { held.mouse.remove(btn); }
                 _ => {}
             }
 
             // Conditional steps — wait before proceeding
             if let KeyAction::WaitForWindow(ref name) = step.action {
-                while !should_stop(stop_flag) {
-                    if input::get_foreground_process_name()
-                        .is_some_and(|fg| fg == *name)
-                    {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(50));
+                let found = || input::get_foreground_process_name().is_some_and(|fg| fg == *name);
+                if wait_until(stop_flag, 50, found) {
+                    return;
                 }
-                if should_stop(stop_flag) { return; }
             } else if window_mode {
                 let process = mac.bound_process.as_deref().unwrap_or("");
-                while !input::execute_action_to_process(&step.action, process, &mut window_target) {
+                while !input::execute_action_to_process(
+                    &step.action,
+                    process,
+                    &mut held.window_target,
+                    stop_flag,
+                ) {
                     if should_stop(stop_flag) {
                         return;
                     }
                     // The cached handle is already gone by now; drop it so the
                     // retry re-resolves instead of failing on a stale one.
-                    window_target.invalidate();
+                    held.window_target.invalidate();
                     thread::sleep(Duration::from_millis(50));
                 }
-            } else if mac.mouse_jitter > 0 {
-                input::execute_action_with_jitter(&step.action, mac.mouse_jitter, &mut rng_state);
             } else {
-                input::execute_action(&step.action);
+                let sent = if mac.mouse_jitter > 0 {
+                    input::execute_action_with_jitter(
+                        &step.action,
+                        mac.mouse_jitter,
+                        &mut rng_state,
+                        stop_flag,
+                    )
+                } else {
+                    input::execute_action(&step.action, stop_flag)
+                };
+                // UIPI or a secure desktop blocks injection silently; without
+                // this the macro "runs" while sending nothing.
+                if !sent && !warned_blocked {
+                    warned_blocked = true;
+                    let _ = fb_tx.send(AppEvent::Warning(
+                        "Input injection blocked (elevated target?)".into(),
+                    ));
+                }
             }
         }
 
@@ -289,6 +394,9 @@ fn execute_macro_inner(
         }
     }
 }
+
+/// How long a bound-process focus answer stays valid before re-querying.
+const FOCUS_RECHECK_INTERVAL: Duration = Duration::from_millis(75);
 
 fn is_bound_process_focused(bound: &str) -> bool {
     input::get_foreground_process_name()
@@ -344,5 +452,55 @@ mod tests {
     fn humanize_extreme_value_does_not_overflow() {
         let d = apply_humanize(50, u64::MAX, 12345);
         assert!(d >= 1);
+    }
+
+    #[test]
+    fn apply_speed_scales_and_keeps_zero() {
+        assert_eq!(apply_speed(0), 0);
+        assert_eq!(apply_speed(100), 100, "default multiplier is 1.0");
+    }
+
+    fn instant_macro(reps: u32) -> Macro {
+        let mut mac = Macro::new("t".into());
+        mac.use_recorded_delays = false;
+        mac.fixed_interval_ms = 0;
+        mac.stop_condition = StopCondition::AfterReps(reps);
+        mac.steps.push(crate::macro_def::MacroStep {
+            action: KeyAction::KeyDown(30),
+            delay_ms: 0,
+        });
+        mac.steps.push(crate::macro_def::MacroStep {
+            action: KeyAction::KeyUp(30),
+            delay_ms: 0,
+        });
+        mac
+    }
+
+    #[test]
+    fn execute_macro_stops_after_exact_reps() {
+        let mac = instant_macro(3);
+        let (tx, rx) = mpsc::channel();
+        let flag = AtomicBool::new(false);
+
+        let completed = execute_macro(&mac, &flag, &tx);
+
+        assert!(completed, "AfterReps is a natural finish");
+        let reps: Vec<u32> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                AppEvent::MacroProgress(_, reps, _) => Some(reps),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reps.last(), Some(&3), "must stop at exactly 3 reps");
+    }
+
+    #[test]
+    fn execute_macro_reports_stop_as_not_completed() {
+        let mac = instant_macro(3);
+        let (tx, _rx) = mpsc::channel();
+        let flag = AtomicBool::new(true);
+
+        assert!(!execute_macro(&mac, &flag, &tx), "an aborted run must not chain");
     }
 }

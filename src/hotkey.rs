@@ -8,6 +8,7 @@ use crate::macro_def::{KeyAction, MouseButton, RepetitionMode};
 use crate::state::AppEvent;
 use crate::{AWAITING_HOTKEY, MOUSE_MOVE_THRESHOLD, QUICK_RECORD, RECORDING, RECORD_MOUSE_MOVES, RUNNING};
 
+/// Bound hotkeys shared between the UI thread (writer) and the scan loop.
 pub struct HotkeyConfig {
     pub bound_keys: Vec<(i32, RepetitionMode)>,
 }
@@ -22,6 +23,54 @@ impl HotkeyConfig {
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const VK_ESCAPE: i32 = 0x1B;
+const VK_MENU: i32 = 0x12;
+const VK_Z: i32 = 0x5A;
+const VK_F1: i32 = 0x70;
+const VK_F2: i32 = 0x71;
+const VK_F3: i32 = 0x72;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Edge {
+    None,
+    Pressed,
+    Released,
+}
+
+fn edge(was: bool, pressed: bool) -> Edge {
+    match (was, pressed) {
+        (false, true) => Edge::Pressed,
+        (true, false) => Edge::Released,
+        _ => Edge::None,
+    }
+}
+
+/// Poll one key, update its previous state, and report the transition.
+fn key_edge(vk: i32, prev_state: &mut [bool; 256]) -> Edge {
+    let pressed = input::is_key_pressed(vk);
+    let e = edge(prev_state[vk as usize], pressed);
+    prev_state[vk as usize] = pressed;
+    e
+}
+
+/// The event a bound key's transition produces for its repetition mode.
+///
+/// Toggle and SingleShot fire on release so the key's own down-state cannot
+/// re-trigger them; HoldToRepeat needs both edges.
+fn bound_key_event(vk: i32, mode: RepetitionMode, e: Edge) -> Option<AppEvent> {
+    match (mode, e) {
+        (RepetitionMode::Toggle | RepetitionMode::SingleShot, Edge::Released) => {
+            Some(AppEvent::HotkeyPressed(vk))
+        }
+        (RepetitionMode::HoldToRepeat, Edge::Pressed) => Some(AppEvent::HotkeyPressed(vk)),
+        (RepetitionMode::HoldToRepeat, Edge::Released) => Some(AppEvent::HotkeyReleased(vk)),
+        _ => None,
+    }
+}
+
+/// Falling edge on Z while Alt is held: the quick-record combo.
+fn quick_record_triggered(prev_state: &mut [bool; 256]) -> bool {
+    key_edge(VK_Z, prev_state) == Edge::Released && input::is_key_pressed(VK_MENU)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -30,6 +79,10 @@ enum Mode {
     Capture,
 }
 
+/// Poll global key state every `POLL_INTERVAL`, translating transitions into
+/// `AppEvent`s according to the current mode (normal, recording, capture).
+///
+/// Runs on its own thread until `RUNNING` drops.
 pub fn hotkey_loop(tx: mpsc::Sender<AppEvent>, config: Arc<Mutex<HotkeyConfig>>) {
     let mut prev_state = [false; 256];
     let mut last_mode = Mode::Normal;
@@ -74,15 +127,14 @@ fn snapshot_all_keys(prev_state: &mut [bool; 256]) {
 
 fn capture_scan(tx: &mpsc::Sender<AppEvent>, prev_state: &mut [bool; 256]) {
     for vk in 0x01i32..=0xFE {
-        if vk == VK_ESCAPE {
+        // Clicking the UI during "press a key" must not bind the macro to a
+        // mouse button, which would then fire on every click anywhere.
+        if vk == VK_ESCAPE || matches!(vk, 0x01 | 0x02 | 0x04) {
             continue;
         }
-        let pressed = input::is_key_pressed(vk);
-        let was = prev_state[vk as usize];
-        if was && !pressed {
+        if key_edge(vk, prev_state) == Edge::Released {
             let _ = tx.send(AppEvent::HotkeyCaptured(vk));
         }
-        prev_state[vk as usize] = pressed;
     }
 }
 
@@ -92,45 +144,26 @@ fn record_scan(
     last_mouse_pos: &mut (i32, i32),
 ) {
     // Quick-record stop: Alt+Z during recording
-    if QUICK_RECORD.load(Ordering::SeqCst) {
-        const VK_Z: i32 = 0x5A;
-        let z_pressed = input::is_key_pressed(VK_Z);
-        let z_was = prev_state[VK_Z as usize];
-        if z_was && !z_pressed && input::is_key_pressed(0x12) { // VK_MENU (Alt)
-            let _ = tx.send(AppEvent::QuickRecordToggle);
-            prev_state[VK_Z as usize] = z_pressed;
-            return;
-        }
-        prev_state[VK_Z as usize] = z_pressed;
+    if QUICK_RECORD.load(Ordering::SeqCst) && quick_record_triggered(prev_state) {
+        let _ = tx.send(AppEvent::QuickRecordToggle);
+        return;
     }
 
-    // Esc = stop recording (falling edge)
-    {
-        let esc_pressed = input::is_key_pressed(VK_ESCAPE);
-        let esc_was = prev_state[VK_ESCAPE as usize];
-        if esc_was && !esc_pressed {
-            let _ = tx.send(AppEvent::RecordStop);
-            prev_state[VK_ESCAPE as usize] = esc_pressed;
-            return;
-        }
-        prev_state[VK_ESCAPE as usize] = esc_pressed;
+    if key_edge(VK_ESCAPE, prev_state) == Edge::Released {
+        let _ = tx.send(AppEvent::RecordStop);
+        return;
     }
 
-    // Recording control keys (falling edge): F1=pause, F2=mouse, F3=threshold
+    // Recording control keys: F1=pause, F2=mouse, F3=threshold.
     // Detected here so they work without TUI focus; excluded from recorded steps below.
-    const VK_F1: i32 = 0x70;
-    const VK_F2: i32 = 0x71;
-    const VK_F3: i32 = 0x72;
-    for &(vk, is_f1, is_f2) in &[(VK_F1, true, false), (VK_F2, false, true), (VK_F3, false, false)] {
-        let pressed = input::is_key_pressed(vk);
-        let was = prev_state[vk as usize];
-        if was && !pressed {
-            let ev = if is_f1 { AppEvent::RecordPauseToggle }
-                else if is_f2 { AppEvent::RecordMouseToggle }
-                else { AppEvent::RecordThresholdCycle };
+    for (vk, ev) in [
+        (VK_F1, AppEvent::RecordPauseToggle),
+        (VK_F2, AppEvent::RecordMouseToggle),
+        (VK_F3, AppEvent::RecordThresholdCycle),
+    ] {
+        if key_edge(vk, prev_state) == Edge::Released {
             let _ = tx.send(ev);
         }
-        prev_state[vk as usize] = pressed;
     }
 
     let now = Instant::now();
@@ -155,23 +188,24 @@ fn record_scan(
         (0x02, MouseButton::Right),
         (0x04, MouseButton::Middle),
     ] {
-        let pressed = input::is_key_pressed(vk);
-        let was = prev_state[vk as usize];
-        if pressed && !was {
-            // Record mouse position before mouse-down events
-            let pos = input::get_cursor_pos();
-            let mut click_time = now;
-            if pos != *last_mouse_pos {
-                let _ = tx.send(AppEvent::RecordKey(KeyAction::MouseMove(pos.0, pos.1), now));
-                *last_mouse_pos = pos;
-                // Small gap so the click doesn't arrive before the move completes
-                click_time = now + Duration::from_millis(10);
+        match key_edge(vk, prev_state) {
+            Edge::Pressed => {
+                // Record mouse position before mouse-down events
+                let pos = input::get_cursor_pos();
+                let mut click_time = now;
+                if pos != *last_mouse_pos {
+                    let _ = tx.send(AppEvent::RecordKey(KeyAction::MouseMove(pos.0, pos.1), now));
+                    *last_mouse_pos = pos;
+                    // Small gap so the click doesn't arrive before the move completes
+                    click_time = now + Duration::from_millis(10);
+                }
+                let _ = tx.send(AppEvent::RecordKey(KeyAction::MouseDown(button), click_time));
             }
-            let _ = tx.send(AppEvent::RecordKey(KeyAction::MouseDown(button), click_time));
-        } else if !pressed && was {
-            let _ = tx.send(AppEvent::RecordKey(KeyAction::MouseUp(button), now));
+            Edge::Released => {
+                let _ = tx.send(AppEvent::RecordKey(KeyAction::MouseUp(button), now));
+            }
+            Edge::None => {}
         }
-        prev_state[vk as usize] = pressed;
     }
 
     // Keyboard keys (0x08 onwards, skip Escape, control keys, and Alt+Z combo)
@@ -180,24 +214,20 @@ fn record_scan(
             continue;
         }
         // Skip Z when Alt is held (quick-record combo)
-        if vk == 0x5A && input::is_key_pressed(0x12) {
+        if vk == VK_Z && input::is_key_pressed(VK_MENU) {
             prev_state[vk as usize] = input::is_key_pressed(vk);
             continue;
         }
-        let pressed = input::is_key_pressed(vk);
-        let was = prev_state[vk as usize];
-        if pressed && !was {
-            let sc = input::vk_to_scancode(vk);
-            if sc != 0 {
-                let _ = tx.send(AppEvent::RecordKey(KeyAction::KeyDown(sc), now));
-            }
-        } else if !pressed && was {
-            let sc = input::vk_to_scancode(vk);
-            if sc != 0 {
-                let _ = tx.send(AppEvent::RecordKey(KeyAction::KeyUp(sc), now));
-            }
+        let down = match key_edge(vk, prev_state) {
+            Edge::Pressed => true,
+            Edge::Released => false,
+            Edge::None => continue,
+        };
+        let sc = input::vk_to_scancode(vk);
+        if sc != 0 {
+            let action = if down { KeyAction::KeyDown(sc) } else { KeyAction::KeyUp(sc) };
+            let _ = tx.send(AppEvent::RecordKey(action, now));
         }
-        prev_state[vk as usize] = pressed;
     }
 }
 
@@ -206,43 +236,72 @@ fn normal_scan(
     config: &Arc<Mutex<HotkeyConfig>>,
     prev_state: &mut [bool; 256],
 ) {
-    // Quick-record: Alt+Z (falling edge on Z while Alt held)
-    const VK_Z: i32 = 0x5A;
-    let z_pressed = input::is_key_pressed(VK_Z);
-    let z_was = prev_state[VK_Z as usize];
-    if z_was && !z_pressed && input::is_key_pressed(0x12) { // VK_MENU (Alt)
+    if quick_record_triggered(prev_state) {
         let _ = tx.send(AppEvent::QuickRecordToggle);
     }
-    prev_state[VK_Z as usize] = z_pressed;
 
-    let keys = if let Ok(cfg) = config.lock() {
-        cfg.bound_keys.clone()
-    } else {
-        return;
-    };
-
-    for (vk, mode) in &keys {
+    // A poisoned lock only means the UI thread panicked while holding it;
+    // the data itself cannot be half-written, and silently returning here
+    // would disable every hotkey for the rest of the session. Iterating
+    // under the lock beats cloning the Vec on every 10 ms poll: the sends
+    // are non-blocking.
+    let cfg = config.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (vk, mode) in &cfg.bound_keys {
         let vk = *vk;
-        if vk <= 0 || vk >= 256 {
+        if !crate::macro_def::is_valid_vk(vk) {
             continue;
         }
-        let pressed = input::is_key_pressed(vk);
-        let was = prev_state[vk as usize];
-        match mode {
-            RepetitionMode::Toggle | RepetitionMode::SingleShot => {
-                if was && !pressed {
-                    let _ = tx.send(AppEvent::HotkeyPressed(vk));
-                }
-            }
-            RepetitionMode::HoldToRepeat => {
-                if !was && pressed {
-                    let _ = tx.send(AppEvent::HotkeyPressed(vk));
-                }
-                if was && !pressed {
-                    let _ = tx.send(AppEvent::HotkeyReleased(vk));
-                }
-            }
+        let e = key_edge(vk, prev_state);
+        if let Some(ev) = bound_key_event(vk, *mode, e) {
+            let _ = tx.send(ev);
         }
-        prev_state[vk as usize] = pressed;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edge_table() {
+        assert_eq!(edge(false, false), Edge::None);
+        assert_eq!(edge(false, true), Edge::Pressed);
+        assert_eq!(edge(true, true), Edge::None);
+        assert_eq!(edge(true, false), Edge::Released);
+    }
+
+    #[test]
+    fn toggle_and_single_shot_fire_on_release_only() {
+        for mode in [RepetitionMode::Toggle, RepetitionMode::SingleShot] {
+            assert!(bound_key_event(65, mode, Edge::Pressed).is_none());
+            assert!(bound_key_event(65, mode, Edge::None).is_none());
+            assert!(matches!(
+                bound_key_event(65, mode, Edge::Released),
+                Some(AppEvent::HotkeyPressed(65))
+            ));
+        }
+    }
+
+    #[test]
+    fn hold_to_repeat_fires_on_both_edges() {
+        assert!(matches!(
+            bound_key_event(65, RepetitionMode::HoldToRepeat, Edge::Pressed),
+            Some(AppEvent::HotkeyPressed(65))
+        ));
+        assert!(matches!(
+            bound_key_event(65, RepetitionMode::HoldToRepeat, Edge::Released),
+            Some(AppEvent::HotkeyReleased(65))
+        ));
+        assert!(bound_key_event(65, RepetitionMode::HoldToRepeat, Edge::None).is_none());
+    }
+
+    #[test]
+    fn held_key_does_not_refire() {
+        // A key held across many polls must produce exactly one transition
+        // per physical press and release, whatever the mode.
+        let states = [false, true, true, true, false, false];
+        let edges: Vec<Edge> = states.windows(2).map(|w| edge(w[0], w[1])).collect();
+        let fired: Vec<&Edge> = edges.iter().filter(|e| **e != Edge::None).collect();
+        assert_eq!(fired, [&Edge::Pressed, &Edge::Released]);
     }
 }

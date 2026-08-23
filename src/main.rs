@@ -17,7 +17,7 @@ use ratatui::DefaultTerminal;
 
 use hotkey::HotkeyConfig;
 use macro_def::{KeyAction, Macro, MacroStep, RepetitionMode, ScrollDirection, SendMode, StopCondition, vk_name};
-use state::{AppEvent, AppState, ConfigField, ExecutorCommand, View};
+use state::{wrap_nav, AppEvent, AppState, ConfigField, ExecutorCommand, View};
 
 pub static RUNNING: AtomicBool = AtomicBool::new(true);
 pub static RECORDING: AtomicBool = AtomicBool::new(false);
@@ -31,6 +31,18 @@ pub static MOUSE_MOVE_THRESHOLD: std::sync::atomic::AtomicU32 = std::sync::atomi
 
 pub const MAIN_BUTTONS: &[&str] = &[
     "Record", "Edit", "Copy", "Delete", "Save", "Toggle", "Mute", "Quit",
+];
+
+/// Status-bar hints for [`MAIN_BUTTONS`], index-aligned with it.
+pub const MAIN_BUTTON_HINTS: &[&str] = &[
+    "Start recording a new macro",
+    "Edit selected macro settings",
+    "Duplicate selected macro",
+    "Delete selected macro",
+    "Save settings and macros to ~/.tapmatic.json",
+    "Enable/disable all macro hotkeys",
+    "Toggle audio feedback",
+    "Exit tapmatic",
 ];
 
 /// Indices into [`MAIN_BUTTONS`], used by the toolbar dispatch.
@@ -48,6 +60,8 @@ const SAVE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Poll the foreground window every N frames (~4x/second at 60fps).
 const FOREGROUND_POLL_FRAMES: u32 = 15;
+/// System stats (CPU, RAM, uptime) refresh every ~1 second at 60 fps.
+const STATS_POLL_FRAMES: u32 = 60;
 
 /// Delay multiplier bounds. Values below 1.0 speed playback up, above slow it
 /// down; the UI presents the reciprocal.
@@ -98,12 +112,11 @@ fn main() {
         .expect("failed to spawn hotkey thread");
 
     let exec_tx = event_tx.clone();
-    std::thread::Builder::new()
+    let executor_handle = std::thread::Builder::new()
         .name("executor".into())
         .spawn(move || executor::executor_loop(cmd_rx, exec_tx))
         .expect("failed to spawn executor thread");
 
-    // Set terminal window title
     crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle("tapmatic")).ok();
 
     let mut terminal = ratatui::init();
@@ -113,8 +126,12 @@ fn main() {
     // run_app flushes on a clean quit; this covers the error path.
     flush_pending_save(&mut state);
 
-    RUNNING.store(false, Ordering::SeqCst);
+    // Stop and join the executor before dropping RUNNING: process exit kills
+    // the macro threads, so leaving before they release their held keys
+    // leaves those keys pressed system-wide.
     let _ = cmd_tx.send(ExecutorCommand::StopAll);
+    let _ = executor_handle.join();
+    RUNNING.store(false, Ordering::SeqCst);
     input::end_high_res_timer();
 
     if let Err(e) = result {
@@ -133,6 +150,7 @@ fn run_app(
     let mut cpu_snapshot = input::get_cpu_usage_snapshot();
     let app_start = std::time::Instant::now();
     let mut last_save = std::time::Instant::now();
+    let mut last_title = String::new();
 
     loop {
         // The foreground window changes at human speed; polling it every frame
@@ -146,9 +164,8 @@ fn run_app(
             last_save = std::time::Instant::now();
         }
 
-        // Update system stats every ~1 second (60 frames)
         frame_count += 1;
-        if frame_count.is_multiple_of(60) {
+        if frame_count.is_multiple_of(STATS_POLL_FRAMES) {
             let new_snapshot = input::get_cpu_usage_snapshot();
             state.cpu_usage = input::calc_cpu_percent(cpu_snapshot, new_snapshot);
             cpu_snapshot = new_snapshot;
@@ -171,7 +188,10 @@ fn run_app(
         } else {
             "tapmatic".into()
         };
-        crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(&title)).ok();
+        if title != last_title {
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(&title));
+            last_title = title;
+        }
 
         terminal.draw(|f| ui::draw(f, state))?;
 
@@ -226,9 +246,50 @@ fn enforce_exclusive_group(
             .map(|m| m.hotkey_vk)
             .collect();
         for vk in to_stop {
-            let _ = cmd_tx.send(ExecutorCommand::StopMacro(vk));
-            state.set_macro_active(vk, false);
+            stop_macro(state, vk, cmd_tx, false);
         }
+    }
+}
+
+/// Append a quick-recorded macro and return to the main view.
+fn commit_quick_recording(state: &mut AppState, mac: Macro) {
+    let count = mac.steps.len();
+    let idx = state.macros.len();
+    state.macros.push(mac);
+    state.selected_macro = idx;
+    state.view = View::Main;
+    state.set_status(format!("Quick recorded {} steps — edit with Space", count));
+    autosave(state);
+}
+
+/// Mouse-move recording thresholds the F3 key cycles through, in pixels.
+const MOUSE_THRESHOLDS: &[u32] = &[1, 3, 5, 10, 20];
+
+fn next_mouse_threshold(current: u32) -> u32 {
+    let pos = MOUSE_THRESHOLDS.iter().position(|&t| t == current);
+    let next = pos.map_or(0, |p| (p + 1) % MOUSE_THRESHOLDS.len());
+    MOUSE_THRESHOLDS[next]
+}
+
+/// Send a command to the executor, surfacing a dead executor thread instead
+/// of silently losing macro control.
+fn send_cmd(state: &mut AppState, cmd_tx: &mpsc::Sender<ExecutorCommand>, cmd: ExecutorCommand) {
+    if cmd_tx.send(cmd).is_err() {
+        state.set_status_persistent("Executor unavailable — macros cannot start or stop");
+    }
+}
+
+/// Stop a macro: send the command, untrack it, and optionally beep.
+fn stop_macro(
+    state: &mut AppState,
+    vk: i32,
+    cmd_tx: &mpsc::Sender<ExecutorCommand>,
+    audible: bool,
+) {
+    send_cmd(state, cmd_tx, ExecutorCommand::StopMacro(vk));
+    state.set_macro_active(vk, false);
+    if audible {
+        audio::play_deactivate();
     }
 }
 
@@ -240,8 +301,11 @@ fn start_macro(
 ) {
     let vk = mac.hotkey_vk;
     enforce_exclusive_group(state, &mac, cmd_tx);
-    let _ = cmd_tx.send(ExecutorCommand::StartMacro(mac));
-    state.set_macro_active(vk, true);
+    send_cmd(state, cmd_tx, ExecutorCommand::StartMacro(mac));
+    // Chained macros may be unbound; vk 0 must not enter the active list.
+    if vk != 0 {
+        state.set_macro_active(vk, true);
+    }
     audio::play_activate();
 }
 
@@ -258,9 +322,7 @@ fn handle_app_event(
                 match mac.repetition {
                     RepetitionMode::Toggle => {
                         if state.is_macro_active(vk) {
-                            let _ = cmd_tx.send(ExecutorCommand::StopMacro(vk));
-                            state.set_macro_active(vk, false);
-                            audio::play_deactivate();
+                            stop_macro(state, vk, cmd_tx, true);
                         } else if macro_allowed(state, &mac) {
                             start_macro(state, mac, cmd_tx);
                         }
@@ -276,73 +338,13 @@ fn handle_app_event(
         AppEvent::HotkeyReleased(vk) => {
             if let Some((_, mac)) = state.macro_by_hotkey(vk)
                 && mac.repetition == RepetitionMode::HoldToRepeat && state.is_macro_active(vk) {
-                    let _ = cmd_tx.send(ExecutorCommand::StopMacro(vk));
-                    state.set_macro_active(vk, false);
-                    audio::play_deactivate();
+                    stop_macro(state, vk, cmd_tx, true);
                 }
         }
         AppEvent::HotkeyCaptured(vk) => {
-            if (state.awaiting_hotkey || state.awaiting_require_held)
-                && let View::Config(idx) = state.view {
-                    // Check for duplicate hotkey before mutable borrow
-                    let dupe_name = if state.awaiting_hotkey {
-                        state.macros.iter().enumerate()
-                            .find(|(i, m)| *i != idx && m.hotkey_vk == vk)
-                            .map(|(_, m)| m.name.clone())
-                    } else { None };
-
-                    if let Some(mac) = state.macros.get_mut(idx) {
-                        let label = if state.awaiting_hotkey {
-                            mac.hotkey_vk = vk;
-                            if let Some(other) = dupe_name {
-                                format!("Hotkey [{}] — WARNING: also used by '{}'", vk_name(vk), other)
-                            } else {
-                                format!("Hotkey set to [{}]", vk_name(vk))
-                            }
-                        } else {
-                            mac.require_held_vk = vk;
-                            format!("Require held: [{}]", vk_name(vk))
-                        };
-                        state.awaiting_hotkey = false;
-                        state.awaiting_require_held = false;
-                        AWAITING_HOTKEY.store(false, Ordering::SeqCst);
-                        state.set_status(label);
-                    }
-                }
-            if state.editing_step_action
-                && let View::StepEditor(idx) = state.view {
-                    let sc = input::vk_to_scancode(vk);
-                    if let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
-                        let is_down = matches!(
-                            step.action,
-                            KeyAction::KeyDown(_) | KeyAction::MouseDown(_)
-                        );
-                        if let Some(new_action) = KeyAction::from_vk(vk, sc, is_down) {
-                            let name = new_action.display_name();
-                            step.action = new_action;
-                            state.set_status(format!("Action changed to {}", name));
-                        }
-                    }
-                    state.editing_step_action = false;
-                    AWAITING_HOTKEY.store(false, Ordering::SeqCst);
-                }
-            if state.inserting_key_step
-                && let View::StepEditor(idx) = state.view {
-                    let sc = input::vk_to_scancode(vk);
-                    if let (Some(action_down), Some(action_up)) = (
-                        KeyAction::from_vk(vk, sc, true),
-                        KeyAction::from_vk(vk, sc, false),
-                    ) {
-                        let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
-                        let name = action_down.display_name();
-                        state.macros[idx].steps.insert(pos, MacroStep { action: action_down, delay_ms: 0 });
-                        state.macros[idx].steps.insert(pos + 1, MacroStep { action: action_up, delay_ms: 50 });
-                        state.selected_step = pos;
-                        state.set_status(format!("Inserted {} (down+up)", name));
-                    }
-                    state.inserting_key_step = false;
-                    AWAITING_HOTKEY.store(false, Ordering::SeqCst);
-                }
+            capture_config_binding(state, vk);
+            capture_step_replacement(state, vk);
+            capture_key_pair_insert(state, vk);
         }
         AppEvent::MacroProgress(vk, reps, secs) => {
             state.macro_progress.insert(vk, (reps, secs));
@@ -357,19 +359,15 @@ fn handle_app_event(
             audio::play_deactivate();
         }
         AppEvent::ChainMacro(name) => {
-            if let Some((_, mac)) = state
-                .macros
-                .iter()
-                .enumerate()
-                .find(|(_, m)| m.name == name)
-            {
+            if let Some(mac) = state.macros.iter().find(|m| m.name == name) {
                 let mac = mac.clone();
-                let vk = mac.hotkey_vk;
-                let _ = cmd_tx.send(ExecutorCommand::StartMacro(mac));
-                if vk != 0 {
-                    state.set_macro_active(vk, true);
+                // Chain starts obey the same gates as hotkey starts; an
+                // ungated restart would bypass the kill switch and process
+                // binding.
+                if macro_allowed(state, &mac) && !state.is_macro_active(mac.hotkey_vk) {
+                    start_macro(state, mac, cmd_tx);
+                    state.set_status(format!("Chained: {}", name));
                 }
-                state.set_status(format!("Chained: {}", name));
             }
         }
         AppEvent::QuickRecordToggle => {
@@ -381,13 +379,7 @@ fn handle_app_event(
                     state.view = View::Main;
                     state.set_status("Quick record cancelled — no keys captured");
                 } else {
-                    let count = mac.steps.len();
-                    let idx = state.macros.len();
-                    state.macros.push(mac);
-                    state.selected_macro = idx;
-                    state.view = View::Main;
-                    state.set_status(format!("Quick recorded {} steps — edit with Space", count));
-                    autosave(state);
+                    commit_quick_recording(state, mac);
                 }
                 QUICK_RECORD.store(false, Ordering::SeqCst);
             } else if state.view == View::Main {
@@ -397,6 +389,9 @@ fn handle_app_event(
                 state.set_status_persistent("Quick recording... Alt+Z to stop");
             }
         }
+        AppEvent::Warning(msg) => {
+            state.set_status_persistent(msg);
+        }
         AppEvent::RecordStop => {
             if state.view == View::Recording {
                 let mac = recorder::stop_recording(state);
@@ -405,14 +400,7 @@ fn handle_app_event(
                     state.view = View::Main;
                     state.set_status("Recording cancelled — no keys captured");
                 } else if QUICK_RECORD.load(Ordering::SeqCst) {
-                    // Quick record: save directly to main
-                    let count = mac.steps.len();
-                    let idx = state.macros.len();
-                    state.macros.push(mac);
-                    state.selected_macro = idx;
-                    state.view = View::Main;
-                    state.set_status(format!("Quick recorded {} steps — edit with Space", count));
-                    autosave(state);
+                    commit_quick_recording(state, mac);
                 } else {
                     // Normal record: go to config
                     let count = mac.steps.len();
@@ -454,14 +442,87 @@ fn handle_app_event(
         }
         AppEvent::RecordThresholdCycle => {
             if state.view == View::Recording {
-                state.mouse_move_threshold = match state.mouse_move_threshold {
-                    1 => 3, 3 => 5, 5 => 10, 10 => 20, _ => 1,
-                };
+                state.mouse_move_threshold = next_mouse_threshold(state.mouse_move_threshold);
                 MOUSE_MOVE_THRESHOLD.store(state.mouse_move_threshold, Ordering::SeqCst);
                 state.set_status(format!("Mouse threshold: {}px", state.mouse_move_threshold));
             }
         }
     }
+}
+
+/// Bind a captured key as a Config-view hotkey or require-held key.
+fn capture_config_binding(state: &mut AppState, vk: i32) {
+    if !(state.awaiting_hotkey || state.awaiting_require_held) {
+        return;
+    }
+    let View::Config(idx) = state.view else { return };
+
+    // Check for duplicate hotkey before the mutable borrow.
+    let dupe_name = if state.awaiting_hotkey {
+        state.macros.iter().enumerate()
+            .find(|(i, m)| *i != idx && m.hotkey_vk == vk)
+            .map(|(_, m)| m.name.clone())
+    } else { None };
+
+    let Some(mac) = state.macros.get_mut(idx) else { return };
+    let label = if state.awaiting_hotkey {
+        mac.hotkey_vk = vk;
+        if let Some(other) = dupe_name {
+            format!("Hotkey [{}] — WARNING: also used by '{}'", vk_name(vk), other)
+        } else {
+            format!("Hotkey set to [{}]", vk_name(vk))
+        }
+    } else {
+        mac.require_held_vk = vk;
+        format!("Require held: [{}]", vk_name(vk))
+    };
+    state.awaiting_hotkey = false;
+    state.awaiting_require_held = false;
+    AWAITING_HOTKEY.store(false, Ordering::SeqCst);
+    state.set_status(label);
+}
+
+/// Replace the selected step's action with a captured key, keeping direction.
+fn capture_step_replacement(state: &mut AppState, vk: i32) {
+    if !state.editing_step_action {
+        return;
+    }
+    let View::StepEditor(idx) = state.view else { return };
+
+    let sc = input::vk_to_scancode(vk);
+    if let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
+        let is_down = matches!(step.action, KeyAction::KeyDown(_) | KeyAction::MouseDown(_));
+        if let Some(new_action) = KeyAction::from_vk(vk, sc, is_down) {
+            let name = new_action.display_name();
+            step.action = new_action;
+            state.set_status(format!("Action changed to {}", name));
+        }
+    }
+    state.editing_step_action = false;
+    AWAITING_HOTKEY.store(false, Ordering::SeqCst);
+}
+
+/// Insert a captured key as a down+up step pair after the selection.
+fn capture_key_pair_insert(state: &mut AppState, vk: i32) {
+    if !state.inserting_key_step {
+        return;
+    }
+    let View::StepEditor(idx) = state.view else { return };
+
+    let sc = input::vk_to_scancode(vk);
+    if let (Some(action_down), Some(action_up)) = (
+        KeyAction::from_vk(vk, sc, true),
+        KeyAction::from_vk(vk, sc, false),
+    ) {
+        let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
+        let name = action_down.display_name();
+        state.macros[idx].steps.insert(pos, MacroStep { action: action_down, delay_ms: 0 });
+        state.macros[idx].steps.insert(pos + 1, MacroStep { action: action_up, delay_ms: 50 });
+        state.selected_step = pos;
+        state.set_status(format!("Inserted {} (down+up)", name));
+    }
+    state.inserting_key_step = false;
+    AWAITING_HOTKEY.store(false, Ordering::SeqCst);
 }
 
 fn handle_key(
@@ -473,7 +534,9 @@ fn handle_key(
 ) {
     match &state.view {
         View::Main => handle_key_main(state, key, mods, cmd_tx, hotkey_config),
-        View::Recording => handle_key_recording(state, key, hotkey_config),
+        // Recording controls (Esc, F1-F3, Alt+Z) arrive as AppEvents from the
+        // hotkey thread so they work without TUI focus; keys here are ignored.
+        View::Recording => {}
         View::Config(_) => handle_key_config(state, key, mods, hotkey_config),
         View::StepEditor(_) => handle_key_step_editor(state, key, mods),
         View::ProcessPicker(_) => handle_key_process_picker(state, key),
@@ -481,8 +544,6 @@ fn handle_key(
         View::Help => handle_key_help(state, key),
     }
 }
-
-// Up/Down = navigate macro list, Left/Right = navigate buttons, Enter = activate button
 
 fn activate_button(
     state: &mut AppState,
@@ -528,14 +589,14 @@ fn activate_button(
         }
         BTN_SAVE => {
             autosave(state);
-            state.set_status(format!("Saved {} macros to .tapmatic.json", state.macros.len()));
+            state.set_status(format!("Saved {} macros to {}", state.macros.len(), persistence::FILE_NAME));
         }
         BTN_TOGGLE => {
             state.macros_enabled = !state.macros_enabled;
             MACROS_ENABLED.store(state.macros_enabled, Ordering::SeqCst);
             if !state.macros_enabled {
                 for vk in std::mem::take(&mut state.active_macros) {
-                    let _ = cmd_tx.send(ExecutorCommand::StopMacro(vk));
+                    send_cmd(state, cmd_tx, ExecutorCommand::StopMacro(vk));
                 }
             }
             if state.macros_enabled {
@@ -633,8 +694,7 @@ fn handle_key_main(
                     let name = state.macros[real_idx].name.clone();
                     let vk = state.macros[real_idx].hotkey_vk;
                     if state.is_macro_active(vk) {
-                        let _ = cmd_tx.send(ExecutorCommand::StopMacro(vk));
-                        state.set_macro_active(vk, false);
+                        stop_macro(state, vk, cmd_tx, false);
                     }
                     state.macros.remove(real_idx);
                     state.clamp_selection();
@@ -668,15 +728,12 @@ fn handle_key_main(
     }
 
     match key {
-        // List navigation
         KeyCode::Up => state.move_selection(true),
         KeyCode::Down => state.move_selection(false),
 
-        // Button bar navigation
         KeyCode::Left => wrap_nav(&mut state.selected_button, MAIN_BUTTONS.len(), true),
         KeyCode::Right => wrap_nav(&mut state.selected_button, MAIN_BUTTONS.len(), false),
 
-        // Enter = activate selected button
         KeyCode::Enter => {
             activate_button(state, cmd_tx, hotkey_config);
         }
@@ -692,7 +749,6 @@ fn handle_key_main(
         }
 
         KeyCode::Char('z') | KeyCode::Char('Z') => {
-            // Undo
             if state.pop_undo() {
                 update_hotkey_config(state, hotkey_config);
                 autosave(state);
@@ -702,7 +758,6 @@ fn handle_key_main(
             }
         }
         KeyCode::F(2) => {
-            // Rename selected macro inline
             if let Some(real_idx) = resolve_selected_macro(state) {
                 state.renaming = true;
                 state.rename_buf = state.macros[real_idx].name.clone();
@@ -711,7 +766,6 @@ fn handle_key_main(
             }
         }
         KeyCode::Char('k') | KeyCode::Char('K') => {
-            // Move macro up
             if let Some(real_idx) = resolve_selected_macro(state)
                 && real_idx > 0 {
                     state.push_undo();
@@ -721,7 +775,6 @@ fn handle_key_main(
                 }
         }
         KeyCode::Char('j') | KeyCode::Char('J') => {
-            // Move macro down
             if let Some(real_idx) = resolve_selected_macro(state)
                 && real_idx + 1 < state.macros.len() {
                     state.push_undo();
@@ -733,7 +786,6 @@ fn handle_key_main(
                 }
         }
         KeyCode::Char('/') => {
-            // Search
             state.searching = true;
             state.search_query.clear();
             state.text_cursor = 0;
@@ -789,15 +841,6 @@ fn handle_key_main(
     }
 }
 
-fn handle_key_recording(
-    _state: &mut AppState,
-    _key: KeyCode,
-    _hotkey_config: &Arc<Mutex<HotkeyConfig>>,
-) {
-    // All recording controls (Esc, F1, F2, F3, Alt+Z) are handled via AppEvent
-    // from the hotkey thread so they work without TUI focus.
-}
-
 fn save_config(state: &mut AppState, idx: usize, hotkey_config: &Arc<Mutex<HotkeyConfig>>) {
     apply_config_field(state, idx);
     state.config_macro_backup = None;
@@ -838,10 +881,6 @@ fn request_quit(state: &mut AppState) {
     }
 }
 
-/// Persist the current state, reporting any failure in the status bar.
-///
-/// Does nothing when the config on disk could not be parsed at startup, so a
-/// save never overwrites a file we failed to read.
 /// Mark the config dirty so the event loop flushes it shortly.
 ///
 /// Called from every mutating key handler, so it must not touch the disk: the
@@ -990,7 +1029,6 @@ fn handle_key_config(
                     state.set_status_persistent("Press the key that must be held...");
                 }
                 ConfigField::ChainMacro => {
-                    // Open chain macro picker
                     state.chain_list = state
                         .macros
                         .iter()
@@ -1002,13 +1040,11 @@ fn handle_key_config(
                     state.view = View::ChainPicker(idx);
                 }
                 ConfigField::BoundProcess => {
-                    // Open process picker
                     state.process_list = input::get_window_list();
                     state.selected_process = 0;
                     state.view = View::ProcessPicker(idx);
                 }
                 _ => {
-                    // Move to next field
                     state.config_field = state.config_field.next_in_tab(state.config_tab);
                     prefill_config_buf(state, idx);
                 }
@@ -1042,124 +1078,12 @@ fn handle_key_config(
 }
 
 fn apply_config_field(state: &mut AppState, idx: usize) {
-    match state.config_field {
-        ConfigField::Name
-            if !state.config_input_buf.is_empty() => {
-                state.macros[idx].name = state.config_input_buf.clone();
-            }
-        ConfigField::FixedInterval => {
-            if let Ok(ms) = state.config_input_buf.parse::<u64>()
-                && ms > 0 {
-                    state.macros[idx].fixed_interval_ms = ms;
-                }
-        }
-        ConfigField::RandomDelayMin => {
-            if let Ok(ms) = state.config_input_buf.parse::<u64>() {
-                let max = state.macros[idx].random_delay.map_or(ms, |(_, mx)| mx);
-                state.macros[idx].random_delay = Some((ms, max.max(ms)));
-            } else if state.config_input_buf.is_empty() {
-                state.macros[idx].random_delay = None;
-            }
-        }
-        ConfigField::RandomDelayMax => {
-            if let Ok(ms) = state.config_input_buf.parse::<u64>() {
-                let min = state.macros[idx].random_delay.map_or(0, |(mn, _)| mn);
-                state.macros[idx].random_delay = Some((min, ms.max(min)));
-            }
-        }
-        ConfigField::StopValue => {
-            if let Ok(val) = state.config_input_buf.parse::<u32>()
-                && val > 0 {
-                    state.macros[idx].stop_condition = state.macros[idx].stop_condition.with_value(val);
-                }
-        }
-        ConfigField::CycleDelay => {
-            if let Ok(ms) = state.config_input_buf.parse::<u64>() {
-                state.macros[idx].cycle_delay_ms = ms;
-            }
-        }
-        ConfigField::StartDelay => {
-            if let Ok(ms) = state.config_input_buf.parse::<u64>() {
-                state.macros[idx].start_delay_ms = ms;
-            }
-        }
-        ConfigField::MouseJitter => {
-            if let Ok(px) = state.config_input_buf.parse::<u32>() {
-                state.macros[idx].mouse_jitter = px;
-            }
-        }
-        ConfigField::HumanizeMs => {
-            if let Ok(ms) = state.config_input_buf.parse::<u64>() {
-                state.macros[idx].humanize_ms = ms;
-            }
-        }
-        ConfigField::ExclusiveGroup | ConfigField::ChainMacro | ConfigField::BoundProcess => {
-            let val = state.config_input_buf.trim().to_string();
-            let opt = if val.is_empty() { None } else {
-                Some(if state.config_field == ConfigField::BoundProcess { val.to_lowercase() } else { val })
-            };
-            match state.config_field {
-                ConfigField::ExclusiveGroup => state.macros[idx].exclusive_group = opt,
-                ConfigField::ChainMacro => state.macros[idx].chain_macro = opt,
-                ConfigField::BoundProcess => state.macros[idx].bound_process = opt,
-                _ => {}
-            }
-        }
-        _ => {}
-    }
+    let input = state.config_input_buf.clone();
+    state.config_field.write(&mut state.macros[idx], &input);
 }
 
 fn prefill_config_buf(state: &mut AppState, idx: usize) {
-    match state.config_field {
-        ConfigField::Name => {
-            state.config_input_buf = state.macros[idx].name.clone();
-        }
-        ConfigField::FixedInterval => {
-            state.config_input_buf = state.macros[idx].fixed_interval_ms.to_string();
-        }
-        ConfigField::RandomDelayMin => {
-            state.config_input_buf = state.macros[idx]
-                .random_delay
-                .map_or(String::new(), |(min, _)| min.to_string());
-        }
-        ConfigField::RandomDelayMax => {
-            state.config_input_buf = state.macros[idx]
-                .random_delay
-                .map_or(String::new(), |(_, max)| max.to_string());
-        }
-        ConfigField::StopValue => {
-            state.config_input_buf = state.macros[idx].stop_condition
-                .value()
-                .map_or(String::new(), |n| n.to_string());
-        }
-        ConfigField::CycleDelay => {
-            state.config_input_buf = state.macros[idx].cycle_delay_ms.to_string();
-        }
-        ConfigField::StartDelay => {
-            state.config_input_buf = state.macros[idx].start_delay_ms.to_string();
-        }
-        ConfigField::RequireHeld => {
-            state.config_input_buf.clear();
-        }
-        ConfigField::MouseJitter => {
-            state.config_input_buf = state.macros[idx].mouse_jitter.to_string();
-        }
-        ConfigField::HumanizeMs => {
-            state.config_input_buf = state.macros[idx].humanize_ms.to_string();
-        }
-        ConfigField::ExclusiveGroup | ConfigField::ChainMacro | ConfigField::BoundProcess => {
-            let mac = &state.macros[idx];
-            state.config_input_buf = match state.config_field {
-                ConfigField::ExclusiveGroup => mac.exclusive_group.clone(),
-                ConfigField::ChainMacro => mac.chain_macro.clone(),
-                ConfigField::BoundProcess => mac.bound_process.clone(),
-                _ => None,
-            }.unwrap_or_default();
-        }
-        _ => {
-            state.config_input_buf.clear();
-        }
-    }
+    state.config_input_buf = state.config_field.read(&state.macros[idx]);
     state.text_cursor = state.config_input_buf.chars().count();
 }
 
@@ -1396,7 +1320,8 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                     KeyAction::KeyUp(sc) => KeyAction::KeyDown(sc),
                     KeyAction::MouseDown(b) => KeyAction::MouseUp(b),
                     KeyAction::MouseUp(b) => KeyAction::MouseDown(b),
-                    other => other, // TypeText stays as-is
+                    // Steps without a direction (TypeText, scroll, move, wait)
+                    other => other,
                 };
                 let name = step.action.display_name();
                 state.set_status(format!("Swapped to {}", name));
@@ -1440,14 +1365,12 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             }
         }
         KeyCode::Char('i') | KeyCode::Char('I') => {
-            // Insert TypeText step
             state.inserting_text = true;
             state.insert_text_buf.clear();
             state.text_cursor = 0;
             state.set_status_persistent("Type text and press Enter to insert...");
         }
         KeyCode::Char('n') | KeyCode::Char('N') => {
-            // Insert key step via capture
             state.inserting_key_step = true;
             AWAITING_HOTKEY.store(true, Ordering::SeqCst);
             state.set_status_persistent("Press a key to insert (down+up pair)...");
@@ -1584,17 +1507,6 @@ fn handle_key_help(state: &mut AppState, key: KeyCode) {
 }
 
 /// Wrapping navigation: move cursor up/down in a list of `count` items.
-fn wrap_nav(current: &mut usize, count: usize, up: bool) {
-    if count == 0 {
-        return;
-    }
-    if up {
-        *current = if *current > 0 { *current - 1 } else { count - 1 };
-    } else {
-        *current = if *current + 1 < count { *current + 1 } else { 0 };
-    }
-}
-
 fn update_hotkey_config(state: &AppState, config: &Arc<Mutex<HotkeyConfig>>) {
     let entries: Vec<(i32, RepetitionMode)> = state
         .macros
@@ -1602,9 +1514,12 @@ fn update_hotkey_config(state: &AppState, config: &Arc<Mutex<HotkeyConfig>>) {
         .filter(|m| m.hotkey_vk != 0)
         .map(|m| (m.hotkey_vk, m.repetition))
         .collect();
-    if let Ok(mut cfg) = config.lock() {
-        cfg.bound_keys = entries;
-    }
+    // See normal_scan: recovering from a poisoned lock beats silently never
+    // applying hotkey changes again.
+    config
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .bound_keys = entries;
 }
 
 #[cfg(test)]
@@ -1629,12 +1544,42 @@ mod tests {
     }
 
     #[test]
-    fn flush_is_a_noop_when_nothing_changed() {
+    fn flush_is_blocked_by_an_unreadable_config() {
         let mut s = AppState::new();
         s.config_read_failed = true;
         s.unsaved_changes = true;
         flush_pending_save(&mut s);
         assert!(s.unsaved_changes, "blocked config keeps the flag, writes nothing");
+    }
+
+    /// Both flush paths in one test: env vars are process-global, so two
+    /// parallel tests redirecting HOME would race each other.
+    #[test]
+    #[cfg(unix)]
+    fn flush_writes_on_success_and_reports_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tapmatic-flush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp home");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let mut s = AppState::new();
+        s.macros.push(Macro::new("flushed".into()));
+        s.unsaved_changes = true;
+        flush_pending_save(&mut s);
+        assert!(!s.unsaved_changes, "successful flush clears the dirty flag");
+        assert!(dir.join(".tapmatic.json").exists(), "config written to HOME");
+
+        // Err path: a read-only home makes the temp-file creation fail.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        s.unsaved_changes = true;
+        flush_pending_save(&mut s);
+        assert!(
+            s.status_message.as_ref().is_some_and(|(m, _, _)| m.contains("Save failed")),
+            "a failed save must be reported, not silently dropped"
+        );
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
     }
 
     //
@@ -1657,6 +1602,144 @@ mod tests {
 
     fn press(state: &mut AppState, key: KeyCode) {
         handle_key_step_editor(state, key, KeyModifiers::NONE);
+    }
+
+    fn main_harness() -> (
+        mpsc::Sender<ExecutorCommand>,
+        mpsc::Receiver<ExecutorCommand>,
+        Arc<Mutex<HotkeyConfig>>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        (tx, rx, Arc::new(Mutex::new(HotkeyConfig::new())))
+    }
+
+    fn named_macros(names: &[&str]) -> AppState {
+        let mut s = AppState::new();
+        for (i, name) in names.iter().enumerate() {
+            let mut mac = Macro::new((*name).into());
+            mac.hotkey_vk = 0x41 + i as i32;
+            s.macros.push(mac);
+        }
+        s
+    }
+
+    #[test]
+    fn delete_under_filter_removes_the_highlighted_macro() {
+        let (tx, _rx, cfg) = main_harness();
+        let mut s = named_macros(&["alpha", "beta", "gamma"]);
+        s.search_query = "gamma".into();
+        s.selected_macro = 0;
+        s.confirm_delete = true;
+
+        handle_key_main(&mut s, KeyCode::Enter, KeyModifiers::NONE, &tx, &cfg);
+
+        let names: Vec<&str> = s.macros.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "beta"], "must delete the filtered-to macro");
+    }
+
+    #[test]
+    fn delete_prompt_names_the_filtered_macro() {
+        let (tx, _rx, cfg) = main_harness();
+        let mut s = named_macros(&["alpha", "beta", "gamma"]);
+        s.search_query = "beta".into();
+        s.selected_macro = 0;
+
+        s.selected_button = BTN_DELETE;
+        activate_button(&mut s, &tx, &cfg);
+
+        assert!(s.confirm_delete);
+        assert!(
+            s.status_message.as_ref().is_some_and(|(m, _, _)| m.contains("beta")),
+            "prompt must name the macro that will actually be deleted"
+        );
+    }
+
+    #[test]
+    fn f3_sort_snapshots_undo_and_marks_dirty() {
+        let (tx, _rx, cfg) = main_harness();
+        let mut s = named_macros(&["zeta", "alpha"]);
+
+        handle_key_main(&mut s, KeyCode::F(3), KeyModifiers::NONE, &tx, &cfg);
+
+        assert_eq!(s.sort_mode, state::SortMode::Name);
+        assert_eq!(s.macros[0].name, "alpha");
+        assert_eq!(s.undo_stack.len(), 1, "manual order must be undoable");
+        assert!(s.unsaved_changes, "the sorted order must persist");
+    }
+
+    #[test]
+    fn hotkey_toggle_starts_then_stops() {
+        let (tx, rx, cfg) = main_harness();
+        let mut s = named_macros(&["m"]);
+        let vk = s.macros[0].hotkey_vk;
+
+        handle_app_event(&mut s, AppEvent::HotkeyPressed(vk), &tx, &cfg);
+        assert!(s.is_macro_active(vk));
+        assert!(matches!(rx.try_recv(), Ok(ExecutorCommand::StartMacro(_))));
+
+        handle_app_event(&mut s, AppEvent::HotkeyPressed(vk), &tx, &cfg);
+        assert!(!s.is_macro_active(vk));
+        assert!(matches!(rx.try_recv(), Ok(ExecutorCommand::StopMacro(v)) if v == vk));
+    }
+
+    #[test]
+    fn exclusive_group_stops_the_running_peer() {
+        let (tx, rx, cfg) = main_harness();
+        let mut s = named_macros(&["a", "b"]);
+        s.macros[0].exclusive_group = Some("g".into());
+        s.macros[1].exclusive_group = Some("g".into());
+        let (vk_a, vk_b) = (s.macros[0].hotkey_vk, s.macros[1].hotkey_vk);
+
+        handle_app_event(&mut s, AppEvent::HotkeyPressed(vk_a), &tx, &cfg);
+        handle_app_event(&mut s, AppEvent::HotkeyPressed(vk_b), &tx, &cfg);
+
+        assert!(!s.is_macro_active(vk_a), "peer in the group must stop");
+        assert!(s.is_macro_active(vk_b));
+        let cmds: Vec<ExecutorCommand> = rx.try_iter().collect();
+        assert!(
+            cmds.iter().any(|c| matches!(c, ExecutorCommand::StopMacro(v) if *v == vk_a)),
+            "expected a StopMacro for the peer, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn chain_start_respects_the_kill_switch() {
+        let (tx, rx, cfg) = main_harness();
+        let mut s = named_macros(&["target"]);
+        s.macros_enabled = false;
+
+        handle_app_event(&mut s, AppEvent::ChainMacro("target".into()), &tx, &cfg);
+
+        assert!(rx.try_recv().is_err(), "disabled macros must not chain-start");
+    }
+
+    #[test]
+    fn chain_start_launches_an_allowed_macro() {
+        let (tx, rx, cfg) = main_harness();
+        let mut s = named_macros(&["target"]);
+
+        handle_app_event(&mut s, AppEvent::ChainMacro("target".into()), &tx, &cfg);
+
+        assert!(matches!(rx.try_recv(), Ok(ExecutorCommand::StartMacro(m)) if m.name == "target"));
+    }
+
+    #[test]
+    fn record_key_outside_recording_view_is_ignored() {
+        let (tx, _rx, cfg) = main_harness();
+        let mut s = AppState::new();
+        s.view = View::Main;
+
+        handle_app_event(
+            &mut s,
+            AppEvent::RecordKey(KeyAction::KeyDown(30), std::time::Instant::now()),
+            &tx,
+            &cfg,
+        );
+
+        assert!(
+            s.recording_steps.is_empty(),
+            "keys typed outside recording mode must not be captured"
+        );
     }
 
     #[test]

@@ -47,6 +47,7 @@ pub enum ScrollDirection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A single replayable input event, the unit a macro's steps are made of.
 pub enum KeyAction {
     KeyDown(u16),
     KeyUp(u16),
@@ -229,6 +230,7 @@ impl StopCondition {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// A named, hotkey-bound sequence of steps plus its replay settings.
 pub struct Macro {
     pub name: String,
     pub steps: Vec<MacroStep>,
@@ -318,7 +320,7 @@ impl Macro {
     /// shared between users, and nothing else between `serde_json` and the
     /// executor enforces these bounds.
     pub fn clamp_to_valid_ranges(&mut self) {
-        self.name.truncate(MAX_NAME_LEN);
+        truncate_on_char_boundary(&mut self.name, MAX_NAME_LEN);
         self.steps.truncate(MAX_STEPS);
 
         if !is_valid_vk(self.hotkey_vk) {
@@ -338,23 +340,66 @@ impl Macro {
             self.random_delay = Some((min.min(MAX_DELAY_MS), max.min(MAX_DELAY_MS)));
         }
 
+        if let Some(group) = &mut self.exclusive_group {
+            truncate_on_char_boundary(group, MAX_NAME_LEN);
+        }
+        if let Some(name) = &mut self.chain_macro {
+            truncate_on_char_boundary(name, MAX_NAME_LEN);
+        }
+        if let Some(process) = &mut self.bound_process {
+            truncate_on_char_boundary(process, MAX_PROCESS_NAME_LEN);
+        }
+
         for step in &mut self.steps {
             step.delay_ms = step.delay_ms.min(MAX_DELAY_MS);
-            if let KeyAction::TypeText(text) = &mut step.action {
-                text.truncate(MAX_TYPE_TEXT_LEN);
+            match &mut step.action {
+                KeyAction::TypeText(text) => truncate_on_char_boundary(text, MAX_TYPE_TEXT_LEN),
+                KeyAction::WaitForWindow(process) => {
+                    truncate_on_char_boundary(process, MAX_PROCESS_NAME_LEN)
+                }
+                KeyAction::MouseScroll(_, clicks) => *clicks = (*clicks).min(MAX_SCROLL_CLICKS),
+                KeyAction::MouseMove(x, y) => {
+                    *x = (*x).clamp(-MAX_MOUSE_COORD, MAX_MOUSE_COORD);
+                    *y = (*y).clamp(-MAX_MOUSE_COORD, MAX_MOUSE_COORD);
+                }
+                KeyAction::KeyDown(_)
+                | KeyAction::KeyUp(_)
+                | KeyAction::MouseDown(_)
+                | KeyAction::MouseUp(_) => {}
             }
         }
     }
 }
 
+/// Truncate to at most `max_bytes`, backing up to the nearest char boundary:
+/// `String::truncate` panics on a byte index inside a multibyte character.
+fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
 /// Virtual-key codes are a byte; 0 means "unbound".
-fn is_valid_vk(vk: i32) -> bool {
+pub fn is_valid_vk(vk: i32) -> bool {
     (1..=254).contains(&vk)
 }
 
 const MAX_NAME_LEN: usize = 128;
 const MAX_STEPS: usize = 100_000;
 const MAX_TYPE_TEXT_LEN: usize = 10_000;
+/// Windows MAX_PATH: process names cannot legitimately exceed it.
+const MAX_PROCESS_NAME_LEN: usize = 260;
+const MAX_SCROLL_CLICKS: u32 = 100;
+/// Generous bound for multi-monitor virtual desktops that keeps
+/// `coord + jitter` arithmetic far from i32 overflow.
+const MAX_MOUSE_COORD: i32 = 100_000;
+/// Cap on how many macros a config file may load.
+pub const MAX_MACROS: usize = 1_000;
 /// One hour: long enough for any real macro, short enough to stay in u64 range
 /// once multiplied by the humanize span.
 const MAX_DELAY_MS: u64 = 60 * 60 * 1000;
@@ -827,6 +872,73 @@ mod tests {
         assert_eq!(m.steps[0].delay_ms, 60 * 60 * 1000);
         match &m.steps[0].action {
             KeyAction::TypeText(t) => assert_eq!(t.len(), 10_000),
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clamp_truncates_multibyte_name_on_char_boundary() {
+        // 43 x '€' (3 bytes each) = 129 bytes: byte 128 falls mid-character,
+        // which panicked the old byte-index truncate at every startup.
+        let mut m = Macro::new("\u{20ac}".repeat(43));
+        m.clamp_to_valid_ranges();
+
+        assert!(m.name.len() <= 128);
+        assert_eq!(m.name.chars().count(), 42);
+    }
+
+    #[test]
+    fn clamp_truncates_multibyte_type_text_on_char_boundary() {
+        let mut m = Macro::new("t".into());
+        m.steps.push(MacroStep {
+            action: KeyAction::TypeText("\u{20ac}".repeat(4_000)),
+            delay_ms: 0,
+        });
+        m.clamp_to_valid_ranges();
+
+        match &m.steps[0].action {
+            KeyAction::TypeText(t) => {
+                assert!(t.len() <= 10_000);
+                assert_eq!(t.chars().count(), 3_333);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clamp_bounds_scroll_clicks_and_mouse_coords() {
+        let mut m = Macro::new("t".into());
+        m.steps.push(MacroStep {
+            action: KeyAction::MouseScroll(ScrollDirection::Up, u32::MAX),
+            delay_ms: 0,
+        });
+        m.steps.push(MacroStep {
+            action: KeyAction::MouseMove(i32::MAX, i32::MIN),
+            delay_ms: 0,
+        });
+        m.clamp_to_valid_ranges();
+
+        assert_eq!(m.steps[0].action, KeyAction::MouseScroll(ScrollDirection::Up, 100));
+        assert_eq!(m.steps[1].action, KeyAction::MouseMove(100_000, -100_000));
+    }
+
+    #[test]
+    fn clamp_truncates_optional_strings_and_wait_target() {
+        let mut m = Macro::new("t".into());
+        m.exclusive_group = Some("g".repeat(1_000));
+        m.chain_macro = Some("c".repeat(1_000));
+        m.bound_process = Some("p".repeat(1_000));
+        m.steps.push(MacroStep {
+            action: KeyAction::WaitForWindow("w".repeat(1_000)),
+            delay_ms: 0,
+        });
+        m.clamp_to_valid_ranges();
+
+        assert_eq!(m.exclusive_group.as_ref().unwrap().len(), 128);
+        assert_eq!(m.chain_macro.as_ref().unwrap().len(), 128);
+        assert_eq!(m.bound_process.as_ref().unwrap().len(), 260);
+        match &m.steps[0].action {
+            KeyAction::WaitForWindow(w) => assert_eq!(w.len(), 260),
             other => panic!("unexpected action: {other:?}"),
         }
     }
