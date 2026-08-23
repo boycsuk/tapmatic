@@ -62,8 +62,10 @@ pub fn executor_loop(rx: mpsc::Receiver<ExecutorCommand>, feedback_tx: mpsc::Sen
                         }
                         // The UI already marked the macro active; without this
                         // event it would show as running forever.
-                        Err(_) => {
+                        Err(e) => {
                             let _ = feedback_tx.send(AppEvent::MacroFinished(vk));
+                            let _ = feedback_tx
+                                .send(AppEvent::Warning(format!("Could not start macro: {e}")));
                         }
                     }
                 }

@@ -74,7 +74,9 @@ fn snapshot_all_keys(prev_state: &mut [bool; 256]) {
 
 fn capture_scan(tx: &mpsc::Sender<AppEvent>, prev_state: &mut [bool; 256]) {
     for vk in 0x01i32..=0xFE {
-        if vk == VK_ESCAPE {
+        // Clicking the UI during "press a key" must not bind the macro to a
+        // mouse button, which would then fire on every click anywhere.
+        if vk == VK_ESCAPE || matches!(vk, 0x01 | 0x02 | 0x04) {
             continue;
         }
         let pressed = input::is_key_pressed(vk);
@@ -215,11 +217,14 @@ fn normal_scan(
     }
     prev_state[VK_Z as usize] = z_pressed;
 
-    let keys = if let Ok(cfg) = config.lock() {
-        cfg.bound_keys.clone()
-    } else {
-        return;
-    };
+    // A poisoned lock only means the UI thread panicked while holding it;
+    // the data itself cannot be half-written, and silently returning here
+    // would disable every hotkey for the rest of the session.
+    let keys = config
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .bound_keys
+        .clone();
 
     for (vk, mode) in &keys {
         let vk = *vk;

@@ -482,39 +482,61 @@ mod scroll_hook {
         }
     }
 
+    /// Install the low-level scroll hook on its own message-pump thread.
+    ///
+    /// Blocks until the thread has a message queue and has published its id:
+    /// a `stop()` racing the spawn would otherwise find no target, leaking
+    /// the hook and its thread for the rest of the process.
     pub fn start(tx: mpsc::Sender<AppEvent>) {
-        std::thread::Builder::new()
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_NOREMOVE};
+
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let spawned = std::thread::Builder::new()
             .name("scroll-hook".into())
             .spawn(move || {
                 unsafe {
+                    let warn_tx = tx.clone();
                     SCROLL_TX.with(|cell| {
                         *cell.borrow_mut() = Some(tx);
                     });
 
-                    let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0)
-                        .expect("failed to install mouse hook");
-
-                    // Store thread ID so we can post WM_QUIT to stop
+                    // The first PeekMessageW creates this thread's message
+                    // queue; only then is the published id postable.
+                    let mut msg = std::mem::zeroed();
+                    let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
                     let tid = windows::Win32::System::Threading::GetCurrentThreadId();
                     HOOK_THREAD_ID.store(tid as isize, Ordering::SeqCst);
+                    let _ = ready_tx.send(());
 
-                    // Message pump (required for low-level hooks)
-                    let mut msg = std::mem::zeroed();
-                    while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+                    let Ok(hook) = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0)
+                    else {
+                        // A panic here would only kill this detached thread,
+                        // silently losing scroll capture for the recording.
+                        HOOK_THREAD_ID.store(0, Ordering::SeqCst);
+                        let _ = warn_tx.send(AppEvent::Warning(
+                            "Scroll capture unavailable: mouse hook failed".into(),
+                        ));
+                        return;
+                    };
+
+                    // Message pump (required for low-level hooks); -1 means
+                    // error and must not keep the loop spinning.
+                    while GetMessageW(&mut msg, None, 0, 0).0 > 0 {}
 
                     let _ = UnhookWindowsHookEx(hook);
                 }
-            })
-            .expect("failed to spawn scroll hook thread");
+            });
+        if spawned.is_ok() {
+            let _ = ready_rx.recv();
+        }
     }
 
     pub fn stop() {
         let tid = HOOK_THREAD_ID.swap(0, Ordering::SeqCst);
         if tid != 0 {
             unsafe {
-                use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
-                // WM_QUIT = 0x0012
-                let _ = PostThreadMessageW(tid as u32, 0x0012, WPARAM(0), LPARAM(0));
+                use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+                let _ = PostThreadMessageW(tid as u32, WM_QUIT, WPARAM(0), LPARAM(0));
             }
         }
     }

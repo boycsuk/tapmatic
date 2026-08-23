@@ -121,6 +121,7 @@ pub enum AppEvent {
     RecordMouseToggle,                // F2 during recording
     RecordThresholdCycle,             // F3 during recording
     RecordStop,                       // Esc during recording (works without TUI focus)
+    Warning(String),                  // background-thread failure surfaced in the status bar
 }
 
 #[derive(Debug)]

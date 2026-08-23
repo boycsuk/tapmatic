@@ -400,6 +400,9 @@ fn handle_app_event(
                 state.set_status_persistent("Quick recording... Alt+Z to stop");
             }
         }
+        AppEvent::Warning(msg) => {
+            state.set_status_persistent(msg);
+        }
         AppEvent::RecordStop => {
             if state.view == View::Recording {
                 let mac = recorder::stop_recording(state);
@@ -1605,9 +1608,12 @@ fn update_hotkey_config(state: &AppState, config: &Arc<Mutex<HotkeyConfig>>) {
         .filter(|m| m.hotkey_vk != 0)
         .map(|m| (m.hotkey_vk, m.repetition))
         .collect();
-    if let Ok(mut cfg) = config.lock() {
-        cfg.bound_keys = entries;
-    }
+    // See normal_scan: recovering from a poisoned lock beats silently never
+    // applying hotkey changes again.
+    config
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .bound_keys = entries;
 }
 
 #[cfg(test)]

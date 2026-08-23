@@ -47,6 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The save temp file followed symlinks, was world-readable and was left
   behind when the rename failed. It is now created fresh with owner-only
   permissions (macros can hold typed text) and cleaned up on failure.
+- Stopping a recording could race the scroll-hook thread's startup and leak
+  the system-wide mouse hook (plus its thread) for the rest of the session,
+  with later recordings receiving duplicate scroll events. `start` now waits
+  until the thread is reachable, and a failed hook install reports itself in
+  the status bar instead of panicking the thread.
+- Clicking during "press a key" hotkey capture bound the macro to a mouse
+  button, making it fire on every click anywhere.
+- A poisoned hotkey-config lock silently disabled all hotkeys (and hotkey
+  updates) for the rest of the session.
 
 - Deleting a macro while a search filter was active removed a different macro
   than the highlighted one, and the confirmation prompt named the wrong macro.
