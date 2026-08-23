@@ -33,6 +33,16 @@ pub const MAIN_BUTTONS: &[&str] = &[
     "Record", "Edit", "Copy", "Delete", "Save", "Toggle", "Mute", "Quit",
 ];
 
+/// Indices into [`MAIN_BUTTONS`], used by the toolbar dispatch.
+const BTN_RECORD: usize = 0;
+const BTN_EDIT: usize = 1;
+const BTN_COPY: usize = 2;
+const BTN_DELETE: usize = 3;
+const BTN_SAVE: usize = 4;
+const BTN_TOGGLE: usize = 5;
+const BTN_MUTE: usize = 6;
+const BTN_QUIT: usize = 7;
+
 /// How long a config change may sit in memory before being written to disk.
 const SAVE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -472,7 +482,6 @@ fn handle_key(
     }
 }
 
-// ── Main View ──
 // Up/Down = navigate macro list, Left/Right = navigate buttons, Enter = activate button
 
 fn activate_button(
@@ -481,21 +490,18 @@ fn activate_button(
     hotkey_config: &Arc<Mutex<HotkeyConfig>>,
 ) {
     match state.selected_button {
-        0 => {
-            // Record
+        BTN_RECORD => {
             recorder::start_recording(state);
             update_hotkey_config(state, hotkey_config);
         }
-        1 => {
-            // Edit
+        BTN_EDIT => {
             if let Some(real_idx) = resolve_selected_macro(state) {
                 enter_config(state, real_idx);
             } else {
                 state.set_status("No macros to edit. Record one first");
             }
         }
-        2 => {
-            // Copy
+        BTN_COPY => {
             if let Some(real_idx) = resolve_selected_macro(state) {
                 let src_name = state.macros[real_idx].name.clone();
                 let mut copy = state.macros[real_idx].clone();
@@ -511,8 +517,7 @@ fn activate_button(
                 state.set_status("No macros to copy. Record one first");
             }
         }
-        3 => {
-            // Delete
+        BTN_DELETE => {
             if let Some(real_idx) = resolve_selected_macro(state) {
                 state.confirm_delete = true;
                 let name = &state.macros[real_idx].name;
@@ -521,13 +526,11 @@ fn activate_button(
                 state.set_status("No macros to delete");
             }
         }
-        4 => {
-            // Save to file
+        BTN_SAVE => {
             autosave(state);
             state.set_status(format!("Saved {} macros to .tapmatic.json", state.macros.len()));
         }
-        5 => {
-            // Toggle
+        BTN_TOGGLE => {
             state.macros_enabled = !state.macros_enabled;
             MACROS_ENABLED.store(state.macros_enabled, Ordering::SeqCst);
             if !state.macros_enabled {
@@ -542,8 +545,7 @@ fn activate_button(
             }
             autosave(state);
         }
-        6 => {
-            // Mute
+        BTN_MUTE => {
             state.audio_enabled = !state.audio_enabled;
             AUDIO_ENABLED.store(state.audio_enabled, Ordering::SeqCst);
             if state.audio_enabled {
@@ -553,8 +555,7 @@ fn activate_button(
             }
             autosave(state);
         }
-        7 => {
-            // Quit
+        BTN_QUIT => {
             request_quit(state);
         }
         _ => {}
@@ -585,7 +586,6 @@ fn handle_key_main(
     cmd_tx: &mpsc::Sender<ExecutorCommand>,
     hotkey_config: &Arc<Mutex<HotkeyConfig>>,
 ) {
-    // Renaming mode
     if state.renaming {
         match handle_modal_input(state, TextField::Rename, key, mods) {
             ModalOutcome::Committed(name) => {
@@ -606,7 +606,6 @@ fn handle_key_main(
         return;
     }
 
-    // Search mode
     if state.searching {
         match key {
             KeyCode::Enter | KeyCode::Esc => {
@@ -741,7 +740,6 @@ fn handle_key_main(
             state.set_status_persistent("Type to search...");
         }
         KeyCode::F(3) => {
-            // Cycle sort mode
             state.sort_mode = match state.sort_mode {
                 state::SortMode::None => state::SortMode::Name,
                 state::SortMode::Name => state::SortMode::Hotkey,
@@ -791,8 +789,6 @@ fn handle_key_main(
     }
 }
 
-// ── Recording View ──
-
 fn handle_key_recording(
     _state: &mut AppState,
     _key: KeyCode,
@@ -801,8 +797,6 @@ fn handle_key_recording(
     // All recording controls (Esc, F1, F2, F3, Alt+Z) are handled via AppEvent
     // from the hotkey thread so they work without TUI focus.
 }
-
-// ── Config View ──
 
 fn save_config(state: &mut AppState, idx: usize, hotkey_config: &Arc<Mutex<HotkeyConfig>>) {
     apply_config_field(state, idx);
@@ -1169,8 +1163,6 @@ fn prefill_config_buf(state: &mut AppState, idx: usize) {
     state.text_cursor = state.config_input_buf.chars().count();
 }
 
-// ── Step Editor ──
-
 /// What a modal text input did with a key press.
 enum ModalOutcome {
     /// Enter: the buffer is ready to be applied by the caller.
@@ -1411,7 +1403,6 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             }
         }
         KeyCode::Char('w') | KeyCode::Char('W') => {
-            // Insert scroll up step
             let step = MacroStep {
                 action: KeyAction::MouseScroll(ScrollDirection::Up, 1),
                 delay_ms: 0,
@@ -1420,7 +1411,6 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             state.set_status("Inserted Scroll Up");
         }
         KeyCode::Char('x') | KeyCode::Char('X') => {
-            // Insert scroll down step
             let step = MacroStep {
                 action: KeyAction::MouseScroll(ScrollDirection::Down, 1),
                 delay_ms: 0,
@@ -1429,7 +1419,6 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             state.set_status("Inserted Scroll Down");
         }
         KeyCode::Char('m') | KeyCode::Char('M') => {
-            // Insert MouseMove step at current cursor position
             let (cx, cy) = input::get_cursor_pos();
             let step = MacroStep {
                 action: KeyAction::MouseMove(cx, cy),
@@ -1439,7 +1428,6 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             state.set_status(format!("Inserted Move ({},{})", cx, cy));
         }
         KeyCode::Char('f') | KeyCode::Char('F') => {
-            // Insert WaitForWindow step using current foreground process
             if let Some(fg) = state.foreground_process.clone() {
                 let step = MacroStep {
                     action: KeyAction::WaitForWindow(fg.clone()),
@@ -1465,7 +1453,6 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             state.set_status_persistent("Press a key to insert (down+up pair)...");
         }
         KeyCode::Char('c') | KeyCode::Char('C')
-            // Duplicate selected step(s)
             if step_count > 0 => {
                 let (start, end) = state.step_selection_range();
                 let duped = state.macros[idx].steps[start..=end].to_vec();
@@ -1478,7 +1465,6 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                 state.set_status(format!("Duplicated {} step(s)", count));
             }
         KeyCode::Char('y') | KeyCode::Char('Y')
-            // Copy selected step(s) to clipboard
             if step_count > 0 => {
                 let (start, end) = state.step_selection_range();
                 state.clipboard_steps = state.macros[idx].steps[start..=end].to_vec();
@@ -1486,7 +1472,6 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                 state.set_status(format!("Copied {} step(s)", count));
             }
         KeyCode::Char('p') | KeyCode::Char('P') => {
-            // Paste clipboard steps after selection
             if !state.clipboard_steps.is_empty() {
                 let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
                 let count = state.clipboard_steps.len();
@@ -1514,8 +1499,6 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
         _ => {}
     }
 }
-
-// ── Process Picker ──
 
 fn handle_key_process_picker(state: &mut AppState, key: KeyCode) {
     let idx = match state.view {
@@ -1555,8 +1538,6 @@ fn handle_key_process_picker(state: &mut AppState, key: KeyCode) {
     }
 }
 
-// ── Chain Picker ──
-
 fn handle_key_chain_picker(state: &mut AppState, key: KeyCode) {
     let idx = match state.view {
         View::ChainPicker(i) => i,
@@ -1587,8 +1568,6 @@ fn handle_key_chain_picker(state: &mut AppState, key: KeyCode) {
     }
 }
 
-// ── Help ──
-
 fn handle_key_help(state: &mut AppState, key: KeyCode) {
     match key {
         KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
@@ -1603,8 +1582,6 @@ fn handle_key_help(state: &mut AppState, key: KeyCode) {
         _ => {}
     }
 }
-
-// ── Helpers ──
 
 /// Wrapping navigation: move cursor up/down in a list of `count` items.
 fn wrap_nav(current: &mut usize, count: usize, up: bool) {
@@ -1635,8 +1612,6 @@ mod tests {
     use super::*;
 
 
-    // ── Deferred saving ──
-
     #[test]
     fn autosave_marks_dirty_without_touching_the_disk() {
         let mut s = AppState::new();
@@ -1662,7 +1637,6 @@ mod tests {
         assert!(s.unsaved_changes, "blocked config keeps the flag, writes nothing");
     }
 
-    // ── Step editor key handling ──
     //
     // Characterisation tests: these pin the behaviour of handle_key_step_editor
     // so the modal guards and the command match can be refactored safely.

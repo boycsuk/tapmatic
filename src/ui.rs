@@ -8,8 +8,6 @@ use crate::macro_def::{vk_name, KeyAction, Macro, SendMode, StopCondition};
 use crate::state::{AppState, ConfigField, View};
 use crate::MAIN_BUTTONS;
 
-// ── Theme ──
-
 const ACCENT: Color = Color::Rgb(200, 200, 210);
 const GREEN: Color = Color::Rgb(80, 220, 120);
 const RED: Color = Color::Rgb(255, 90, 90);
@@ -32,8 +30,6 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         View::Help => draw_help(f, state),
     }
 }
-
-// ── Helpers ──
 
 fn status_bar(state: &AppState) -> Line<'_> {
     let macros_span = if state.macros_enabled {
@@ -163,8 +159,6 @@ fn help_key<'a>(key: &'a str, label: &'a str, color: Color) -> Vec<Span<'a>> {
     ]
 }
 
-// ── Main View ──
-
 const BORDER_STYLE: Style = Style::new().fg(DIM);
 
 fn draw_main(f: &mut Frame, state: &AppState) {
@@ -179,7 +173,6 @@ fn draw_main(f: &mut Frame, state: &AppState) {
         ])
         .split(area);
 
-    // ── Status bar in a block ──
     let status_block = Block::default()
         .borders(Borders::ALL)
         .border_style(BORDER_STYLE)
@@ -193,7 +186,6 @@ fn draw_main(f: &mut Frame, state: &AppState) {
 
     let filtered = state.filtered_macro_indices();
 
-    // ── Table or empty state ──
     if filtered.is_empty() {
         let msg = if !state.search_query.is_empty() {
             format!("No macros matching \"{}\"", state.search_query)
@@ -365,7 +357,6 @@ fn draw_main(f: &mut Frame, state: &AppState) {
         f.render_stateful_widget(table, chunks[1], &mut table_state);
     }
 
-    // ── Toolbar block ──
     let button_hint = match state.selected_button {
         0 => "Start recording a new macro",
         1 => "Edit selected macro settings",
@@ -400,8 +391,6 @@ fn draw_main(f: &mut Frame, state: &AppState) {
         );
     }
 }
-
-// ── Recording View ──
 
 fn draw_recording(f: &mut Frame, state: &AppState) {
     let area = f.area();
@@ -542,8 +531,6 @@ fn draw_recording(f: &mut Frame, state: &AppState) {
 
     f.render_widget(Paragraph::new(content).block(block), chunks[1]);
 }
-
-// ── Config View ──
 
 fn config_field_hint(field: ConfigField) -> &'static str {
     match field {
@@ -765,8 +752,6 @@ fn draw_config(f: &mut Frame, state: &AppState, idx: usize) {
     f.render_widget(Paragraph::new(Line::from(spans)), help_inner);
 }
 
-// ── Step Editor View ──
-
 fn draw_step_editor(f: &mut Frame, state: &AppState, idx: usize) {
     let area = f.area();
 
@@ -900,8 +885,6 @@ fn draw_step_editor(f: &mut Frame, state: &AppState, idx: usize) {
     f.render_widget(Paragraph::new(Line::from(spans)), bottom_inner);
 }
 
-// ── Process Picker View ──
-
 /// Shared chrome for the picker views: status bar, bordered table and a
 /// footer of help keys.
 #[allow(clippy::too_many_arguments)]
@@ -992,8 +975,6 @@ fn draw_process_picker(f: &mut Frame, state: &AppState, _idx: usize) {
     );
 }
 
-// ── Chain Picker View ──
-
 fn draw_chain_picker(f: &mut Frame, state: &AppState, _idx: usize) {
     let total = state.chain_list.len();
 
@@ -1028,8 +1009,6 @@ fn draw_chain_picker(f: &mut Frame, state: &AppState, _idx: usize) {
         footer,
     );
 }
-
-// ── Help View ──
 
 fn draw_help(f: &mut Frame, state: &mut AppState) {
     let area = f.area();

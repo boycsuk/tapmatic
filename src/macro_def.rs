@@ -527,8 +527,6 @@ pub fn vk_name(vk: i32) -> &'static str {
 mod tests {
     use super::*;
 
-    // ── RepetitionMode ──
-
     #[test]
     fn repetition_mode_cycle() {
         assert_eq!(RepetitionMode::Toggle.next(), RepetitionMode::HoldToRepeat);
@@ -546,8 +544,6 @@ mod tests {
         assert_eq!(RepetitionMode::HoldToRepeat.label(), "Hold");
         assert_eq!(RepetitionMode::SingleShot.label(), "Single");
     }
-
-    // ── StopCondition ──
 
     #[test]
     fn stop_condition_display() {
@@ -570,8 +566,6 @@ mod tests {
         assert_eq!(StopCondition::None.with_value(100), StopCondition::None);
     }
 
-    // ── KeyAction::from_vk ──
-
     #[test]
     fn from_vk_mouse_buttons() {
         assert_eq!(KeyAction::from_vk(0x01, 0, true), Some(KeyAction::MouseDown(MouseButton::Left)));
@@ -591,8 +585,6 @@ mod tests {
         assert_eq!(KeyAction::from_vk(0xFF, 0, true), None);
         assert_eq!(KeyAction::from_vk(0x03, 0, false), None);
     }
-
-    // ── KeyAction::display_name ──
 
     #[test]
     fn display_name_keys() {
@@ -631,8 +623,6 @@ mod tests {
         assert_eq!(KeyAction::WaitForWindow("notepad.exe".into()).display_name(), "Wait: notepad.exe");
     }
 
-    // ── Macro ──
-
     #[test]
     fn macro_new_defaults() {
         let m = Macro::new("Test".into());
@@ -665,8 +655,6 @@ mod tests {
         assert_eq!(m.step_count(), 2);
         assert_eq!(m.total_duration_ms(), 150);
     }
-
-    // ── Serde round-trip ──
 
     #[test]
     fn serde_all_action_variants() {
@@ -755,8 +743,6 @@ mod tests {
         assert_eq!(m.steps.len(), 1);
     }
 
-    // ── vk_name ──
-
     #[test]
     fn vk_name_known_keys() {
         assert_eq!(vk_name(0x01), "LMB");
@@ -771,15 +757,11 @@ mod tests {
         assert_eq!(vk_name(0x07), "???");
     }
 
-    // ── SendMode ──
-
     #[test]
     fn send_mode_labels() {
         assert_eq!(SendMode::Global.label(), "Global");
         assert_eq!(SendMode::Window.label(), "Window");
     }
-
-    // ── Clamping untrusted config values ──
 
     #[test]
     fn clamp_rejects_out_of_range_vk() {

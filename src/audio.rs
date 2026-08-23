@@ -8,6 +8,16 @@ mod platform {
 
     use crate::AUDIO_ENABLED;
 
+    const E4: f32 = 329.63;
+    const G4: f32 = 392.00;
+    const GS4: f32 = 415.30;
+    const B4: f32 = 493.88;
+    const C5: f32 = 523.25;
+    const EB5: f32 = 622.25;
+    const E5: f32 = 659.25;
+    const G5: f32 = 783.99;
+    const C6: f32 = 1046.50;
+
     fn is_enabled() -> bool {
         AUDIO_ENABLED.load(Ordering::SeqCst)
     }
@@ -61,44 +71,23 @@ mod platform {
     }
 
     pub fn play_activate() {
-        // Majestic ascending power chord: C5 → E5 → G5 with a final C5+E5+G5 chord
         std::thread::spawn(|| {
-            play_notes(&[
-                (523.25, 70),   // C5
-                (659.25, 70),   // E5
-                (783.99, 80),   // G5
-            ], 0.06);
+            play_notes(&[(C5, 70), (E5, 70), (G5, 80)], 0.06);
             std::thread::sleep(Duration::from_millis(230));
-            play_chord(&[523.25, 659.25, 783.99, 1046.50], 200, 0.10); // C major + octave
+            play_chord(&[C5, E5, G5, C6], 200, 0.10);
         });
     }
 
     pub fn play_deactivate() {
-        // Resolving descending: G5 → E5 → C5 minor feel
-        play_notes(&[
-            (783.99, 70),   // G5
-            (622.25, 70),   // Eb5 (minor third)
-            (523.25, 120),  // C5
-        ], 0.07);
+        play_notes(&[(G5, 70), (EB5, 70), (C5, 120)], 0.07);
     }
 
     pub fn play_record_start() {
-        // Energetic ascending arpeggio: E4 → G#4 → B4 → E5
-        play_notes(&[
-            (329.63, 50),   // E4
-            (415.30, 50),   // G#4
-            (493.88, 50),   // B4
-            (659.25, 90),   // E5
-        ], 0.06);
+        play_notes(&[(E4, 50), (GS4, 50), (B4, 50), (E5, 90)], 0.06);
     }
 
     pub fn play_record_stop() {
-        // Gentle descending resolution: B4 → G4 → E4
-        play_notes(&[
-            (493.88, 60),   // B4
-            (392.00, 60),   // G4
-            (329.63, 100),  // E4
-        ], 0.06);
+        play_notes(&[(B4, 60), (G4, 60), (E4, 100)], 0.06);
     }
 }
 

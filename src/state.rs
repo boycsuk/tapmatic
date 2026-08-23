@@ -12,8 +12,6 @@ pub enum SortMode {
     Hotkey,
 }
 
-// ── Views ──
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum View {
     Main,
@@ -109,8 +107,6 @@ impl ConfigField {
     }
 }
 
-// ── Events between threads ──
-
 #[derive(Debug)]
 pub enum AppEvent {
     HotkeyPressed(i32),
@@ -133,8 +129,6 @@ pub enum ExecutorCommand {
     StopMacro(i32),
     StopAll,
 }
-
-// ── Application state ──
 
 pub struct AppState {
     // Macro list
@@ -377,8 +371,6 @@ impl AppState {
         }
     }
 
-    // ── Text buffer editing helpers ──
-
     /// Insert a character at the cursor position.
     pub fn buf_insert(&mut self, buf: &mut String, c: char) {
         let byte_pos = buf.char_indices().nth(self.text_cursor).map_or(buf.len(), |(i, _)| i);
@@ -548,8 +540,6 @@ mod tests {
         s
     }
 
-    // ── Navigation ──
-
     #[test]
     fn move_selection_wraps() {
         let mut s = state_with_macros(&["A", "B", "C"]);
@@ -580,8 +570,6 @@ mod tests {
         s.move_selection(true);
         assert_eq!(s.selected_macro, 1);
     }
-
-    // ── Clamp selection ──
 
     #[test]
     fn clamp_selection_adjusts() {
@@ -642,8 +630,6 @@ mod tests {
         assert_eq!(s.selected_macro, 1);
     }
 
-    // ── Macro active tracking ──
-
     #[test]
     fn macro_active_tracking() {
         let mut s = AppState::new();
@@ -659,8 +645,6 @@ mod tests {
         assert!(!s.is_macro_active(0x41));
         assert!(s.active_macros.is_empty());
     }
-
-    // ── Macro by hotkey ──
 
     #[test]
     fn macro_by_hotkey_found() {
@@ -678,8 +662,6 @@ mod tests {
         assert!(s.macro_by_hotkey(0xFF).is_none());
     }
 
-    // ── Next macro name ──
-
     #[test]
     fn next_macro_name() {
         let s = AppState::new();
@@ -687,8 +669,6 @@ mod tests {
         let s = state_with_macros(&["A", "B", "C"]);
         assert_eq!(s.next_macro_name(), "Macro 4");
     }
-
-    // ── Search / filter ──
 
     #[test]
     fn filtered_macro_indices_no_query() {
@@ -710,8 +690,6 @@ mod tests {
         s.search_query = "zzz".into();
         assert!(s.filtered_macro_indices().is_empty());
     }
-
-    // ── Sort ──
 
     #[test]
     fn apply_sort_by_name() {
@@ -737,8 +715,6 @@ mod tests {
         assert_eq!(s.macros[0].hotkey_vk, 0x10);
         assert_eq!(s.macros[1].hotkey_vk, 0x50);
     }
-
-    // ── Undo ──
 
     #[test]
     fn undo_push_pop() {
@@ -767,8 +743,6 @@ mod tests {
         assert_eq!(s.undo_stack.len(), 20); // capped at 20
     }
 
-    // ── Step selection range ──
-
     #[test]
     fn step_selection_range_no_anchor() {
         let mut s = AppState::new();
@@ -787,8 +761,6 @@ mod tests {
         s.selection_anchor = Some(5);
         assert_eq!(s.step_selection_range(), (1, 5));
     }
-
-    // ── ConfigField helpers ──
 
     #[test]
     fn config_field_next_prev_in_tab() {
@@ -814,8 +786,6 @@ mod tests {
         assert!(!ConfigField::Name.is_numeric_field());
         assert!(!ConfigField::Hotkey.is_numeric_field());
     }
-
-    // ── Status messages ──
 
     #[test]
     fn status_message_lifecycle() {

@@ -1,6 +1,5 @@
 use crate::macro_def::KeyAction;
 
-// ── Windows API wrappers ──
 // Only compiled on Windows. The non-Windows stubs below are no-ops that let
 // the crate build and the suite run off-Windows; no test exercising them
 // proves anything about real input behaviour.
@@ -433,8 +432,6 @@ pub fn calc_cpu_percent(prev: (u64, u64), curr: (u64, u64)) -> u32 {
     let busy = total_diff.saturating_sub(idle_diff);
     (busy.saturating_mul(100) / total_diff) as u32
 }
-
-// ── Scroll recording hook ──
 
 #[cfg(windows)]
 mod scroll_hook {

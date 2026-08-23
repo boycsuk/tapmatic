@@ -160,7 +160,6 @@ fn execute_macro_inner(
     let window_mode = mac.send_mode == SendMode::Window && mac.bound_process.is_some();
     let mut window_target = input::WindowTarget::new();
 
-    // Start delay (countdown before first execution)
     if mac.start_delay_ms > 0
         && sleep_interruptible(mac.start_delay_ms, stop_flag) {
             return;
@@ -172,7 +171,6 @@ fn execute_macro_inner(
                 return;
             }
 
-            // Require held key check
             if mac.require_held_vk != 0 && !input::is_key_pressed(mac.require_held_vk) {
                 while !should_stop(stop_flag) && !input::is_key_pressed(mac.require_held_vk) {
                     thread::sleep(Duration::from_millis(10));
@@ -182,7 +180,6 @@ fn execute_macro_inner(
                 }
             }
 
-            // Process focus check (Global mode only)
             if !window_mode
                 && let Some(ref bound) = mac.bound_process
                     && !is_bound_process_focused(bound) {
@@ -194,7 +191,6 @@ fn execute_macro_inner(
                         }
                     }
 
-            // Compute delay
             let raw_delay = if let Some((min, max)) = mac.random_delay {
                 rng_state ^= rng_state << 13;
                 rng_state ^= rng_state >> 7;
@@ -222,7 +218,6 @@ fn execute_macro_inner(
                     return;
                 }
 
-            // Track pressed state before executing
             match &step.action {
                 KeyAction::KeyDown(sc) => { pressed_keys.insert(*sc); }
                 KeyAction::KeyUp(sc) => { pressed_keys.remove(sc); }
