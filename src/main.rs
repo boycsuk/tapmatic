@@ -1609,6 +1609,10 @@ mod tests {
         mpsc::Receiver<ExecutorCommand>,
         Arc<Mutex<HotkeyConfig>>,
     ) {
+        // On Windows the audio beeps are real rodio threads opening the
+        // device; detached ones racing process exit crash the test binary
+        // (STATUS_ACCESS_VIOLATION) on the headless CI runner.
+        AUDIO_ENABLED.store(false, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         (tx, rx, Arc::new(Mutex::new(HotkeyConfig::new())))
     }

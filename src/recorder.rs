@@ -99,6 +99,8 @@ mod tests {
     use std::time::Duration;
 
     fn recording_state() -> AppState {
+        // See main.rs tests: real audio threads must not outlive the tests.
+        crate::AUDIO_ENABLED.store(false, Ordering::SeqCst);
         AppState::new()
     }
 

@@ -465,12 +465,10 @@ mod tests {
         mac.use_recorded_delays = false;
         mac.fixed_interval_ms = 0;
         mac.stop_condition = StopCondition::AfterReps(reps);
+        // An empty TypeText sends nothing on any platform: on Windows a
+        // KeyDown step would inject a real keystroke into the CI runner.
         mac.steps.push(crate::macro_def::MacroStep {
-            action: KeyAction::KeyDown(30),
-            delay_ms: 0,
-        });
-        mac.steps.push(crate::macro_def::MacroStep {
-            action: KeyAction::KeyUp(30),
+            action: KeyAction::TypeText(String::new()),
             delay_ms: 0,
         });
         mac
