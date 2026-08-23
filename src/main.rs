@@ -567,27 +567,21 @@ fn handle_key_main(
 ) {
     // Renaming mode
     if state.renaming {
-        match key {
-            KeyCode::Enter => {
+        match handle_modal_input(state, TextField::Rename, key, mods) {
+            ModalOutcome::Committed(name) => {
                 if let Some(real_idx) = resolve_selected_macro(state)
-                    && !state.rename_buf.is_empty() {
-                        state.macros[real_idx].name = state.rename_buf.clone();
-                        state.set_status(format!("Renamed to '{}'", state.rename_buf));
+                    && !name.is_empty() {
+                        state.macros[real_idx].name = name.clone();
+                        state.set_status(format!("Renamed to '{}'", name));
                         autosave(state);
                     }
                 state.renaming = false;
-                state.rename_buf.clear();
             }
-            KeyCode::Esc => {
+            ModalOutcome::Cancelled => {
                 state.renaming = false;
-                state.rename_buf.clear();
                 state.set_status("Rename cancelled");
             }
-            _ => {
-                let mut buf = state.rename_buf.clone();
-                handle_text_motion(state, &mut buf, key, mods, true, true);
-                state.rename_buf = buf;
-            }
+            ModalOutcome::Editing => {}
         }
         return;
     }
@@ -1141,14 +1135,88 @@ fn prefill_config_buf(state: &mut AppState, idx: usize) {
 
 // ── Step Editor ──
 
-fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers) {
-    let idx = match state.view {
-        View::StepEditor(i) => i,
-        _ => return,
-    };
+/// What a modal text input did with a key press.
+enum ModalOutcome {
+    /// Enter: the buffer is ready to be applied by the caller.
+    Committed(String),
+    Cancelled,
+    /// The key was consumed as editing input.
+    Editing,
+}
 
-    let step_count = state.macros[idx].steps.len();
+/// Which buffer on `AppState` a modal input is editing.
+#[derive(Clone, Copy)]
+enum TextField {
+    InsertText,
+    ScrollClicks,
+    StepDelay,
+    Rename,
+}
 
+impl TextField {
+    fn get(self, state: &AppState) -> &String {
+        match self {
+            Self::InsertText => &state.insert_text_buf,
+            Self::ScrollClicks => &state.scroll_clicks_buf,
+            Self::StepDelay => &state.step_delay_buf,
+            Self::Rename => &state.rename_buf,
+        }
+    }
+
+    fn set(self, state: &mut AppState, value: String) {
+        match self {
+            Self::InsertText => state.insert_text_buf = value,
+            Self::ScrollClicks => state.scroll_clicks_buf = value,
+            Self::StepDelay => state.step_delay_buf = value,
+            Self::Rename => state.rename_buf = value,
+        }
+    }
+
+    /// Numeric fields reject letters; text fields accept both.
+    fn allows_text(self) -> bool {
+        matches!(self, Self::InsertText | Self::Rename)
+    }
+}
+
+/// Drive one key press through a modal text buffer.
+///
+/// Returns the buffer on Enter and clears it on either Enter or Esc, so callers
+/// only decide what a committed value means.
+fn handle_modal_input(
+    state: &mut AppState,
+    field: TextField,
+    key: KeyCode,
+    mods: KeyModifiers,
+) -> ModalOutcome {
+    match key {
+        KeyCode::Enter => {
+            let value = field.get(state).clone();
+            field.set(state, String::new());
+            ModalOutcome::Committed(value)
+        }
+        KeyCode::Esc => {
+            field.set(state, String::new());
+            ModalOutcome::Cancelled
+        }
+        _ => {
+            let mut buf = field.get(state).clone();
+            handle_text_motion(state, &mut buf, key, mods, field.allows_text(), true);
+            field.set(state, buf);
+            ModalOutcome::Editing
+        }
+    }
+}
+
+/// Handle the modal input layers of the step editor.
+///
+/// Returns true when the key was consumed by a modal, so the command match is
+/// skipped.
+fn handle_step_editor_modal(
+    state: &mut AppState,
+    idx: usize,
+    key: KeyCode,
+    mods: KeyModifiers,
+) -> bool {
     // Awaiting key capture (insert or replace) — only Esc cancels
     if state.inserting_key_step || state.editing_step_action {
         if key == KeyCode::Esc {
@@ -1158,88 +1226,85 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             AWAITING_HOTKEY.store(false, Ordering::SeqCst);
             state.set_status(msg);
         }
-        return;
+        return true;
     }
 
-    // Inserting a TypeText step
     if state.inserting_text {
-        match key {
-            KeyCode::Enter => {
-                if !state.insert_text_buf.is_empty() {
-                    let text = state.insert_text_buf.clone();
+        match handle_modal_input(state, TextField::InsertText, key, mods) {
+            ModalOutcome::Committed(text) => {
+                if !text.is_empty() {
                     let step = MacroStep {
                         action: KeyAction::TypeText(text.clone()),
                         delay_ms: 0,
                     };
-                    // Insert after current selection
-                    let insert_pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
-                    state.macros[idx].steps.insert(insert_pos, step);
-                    state.selected_step = insert_pos;
+                    let pos = insert_step_after_selection(state, idx, step);
+                    state.selected_step = pos;
                     state.set_status(format!("Inserted text: \"{}\"", text));
                 }
                 state.inserting_text = false;
-                state.insert_text_buf.clear();
             }
-            KeyCode::Esc => {
+            ModalOutcome::Cancelled => {
                 state.inserting_text = false;
-                state.insert_text_buf.clear();
                 state.set_status("Insert cancelled");
             }
-            _ => {
-                let mut buf = state.insert_text_buf.clone();
-                handle_text_motion(state, &mut buf, key, mods, true, true);
-                state.insert_text_buf = buf;
-            }
+            ModalOutcome::Editing => {}
         }
-        return;
+        return true;
     }
 
     if state.editing_scroll_clicks {
-        match key {
-            KeyCode::Enter => {
-                if let Ok(clicks) = state.scroll_clicks_buf.parse::<u32>()
+        match handle_modal_input(state, TextField::ScrollClicks, key, mods) {
+            ModalOutcome::Committed(buf) => {
+                if let Ok(clicks) = buf.parse::<u32>()
                     && clicks > 0
                         && let Some(step) = state.macros[idx].steps.get_mut(state.selected_step)
                             && let KeyAction::MouseScroll(dir, ref mut c) = step.action {
                                 *c = clicks;
-                                state.set_status(format!("Scroll {} x{}", if dir == ScrollDirection::Up { "up" } else { "down" }, clicks));
+                                let label = if dir == ScrollDirection::Up { "up" } else { "down" };
+                                state.set_status(format!("Scroll {} x{}", label, clicks));
                             }
                 state.editing_scroll_clicks = false;
-                state.scroll_clicks_buf.clear();
             }
-            KeyCode::Esc => {
-                state.editing_scroll_clicks = false;
-                state.scroll_clicks_buf.clear();
-            }
-            _ => {
-                let mut buf = state.scroll_clicks_buf.clone();
-                handle_text_motion(state, &mut buf, key, mods, false, true);
-                state.scroll_clicks_buf = buf;
-            }
+            ModalOutcome::Cancelled => state.editing_scroll_clicks = false,
+            ModalOutcome::Editing => {}
         }
-        return;
+        return true;
     }
 
     if state.editing_step_delay {
-        match key {
-            KeyCode::Enter => {
-                if let Ok(ms) = state.step_delay_buf.parse::<u64>()
+        match handle_modal_input(state, TextField::StepDelay, key, mods) {
+            ModalOutcome::Committed(buf) => {
+                if let Ok(ms) = buf.parse::<u64>()
                     && let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
                         step.delay_ms = ms;
                     }
                 state.editing_step_delay = false;
-                state.step_delay_buf.clear();
             }
-            KeyCode::Esc => {
-                state.editing_step_delay = false;
-                state.step_delay_buf.clear();
-            }
-            _ => {
-                let mut buf = state.step_delay_buf.clone();
-                handle_text_motion(state, &mut buf, key, mods, false, true);
-                state.step_delay_buf = buf;
-            }
+            ModalOutcome::Cancelled => state.editing_step_delay = false,
+            ModalOutcome::Editing => {}
         }
+        return true;
+    }
+
+    false
+}
+
+/// Insert a step directly after the current selection, returning its position.
+fn insert_step_after_selection(state: &mut AppState, idx: usize, step: MacroStep) -> usize {
+    let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
+    state.macros[idx].steps.insert(pos, step);
+    pos
+}
+
+fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers) {
+    let idx = match state.view {
+        View::StepEditor(i) => i,
+        _ => return,
+    };
+
+    let step_count = state.macros[idx].steps.len();
+
+    if handle_step_editor_modal(state, idx, key, mods) {
         return;
     }
 
@@ -1311,44 +1376,40 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
         }
         KeyCode::Char('w') | KeyCode::Char('W') => {
             // Insert scroll up step
-            let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
-            state.macros[idx].steps.insert(pos, MacroStep {
+            let step = MacroStep {
                 action: KeyAction::MouseScroll(ScrollDirection::Up, 1),
                 delay_ms: 0,
-            });
-            state.selected_step = pos;
+            };
+            state.selected_step = insert_step_after_selection(state, idx, step);
             state.set_status("Inserted Scroll Up");
         }
         KeyCode::Char('x') | KeyCode::Char('X') => {
             // Insert scroll down step
-            let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
-            state.macros[idx].steps.insert(pos, MacroStep {
+            let step = MacroStep {
                 action: KeyAction::MouseScroll(ScrollDirection::Down, 1),
                 delay_ms: 0,
-            });
-            state.selected_step = pos;
+            };
+            state.selected_step = insert_step_after_selection(state, idx, step);
             state.set_status("Inserted Scroll Down");
         }
         KeyCode::Char('m') | KeyCode::Char('M') => {
             // Insert MouseMove step at current cursor position
             let (cx, cy) = input::get_cursor_pos();
-            let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
-            state.macros[idx].steps.insert(pos, MacroStep {
+            let step = MacroStep {
                 action: KeyAction::MouseMove(cx, cy),
                 delay_ms: 0,
-            });
-            state.selected_step = pos;
+            };
+            state.selected_step = insert_step_after_selection(state, idx, step);
             state.set_status(format!("Inserted Move ({},{})", cx, cy));
         }
         KeyCode::Char('f') | KeyCode::Char('F') => {
             // Insert WaitForWindow step using current foreground process
-            if let Some(ref fg) = state.foreground_process {
-                let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
-                state.macros[idx].steps.insert(pos, MacroStep {
+            if let Some(fg) = state.foreground_process.clone() {
+                let step = MacroStep {
                     action: KeyAction::WaitForWindow(fg.clone()),
                     delay_ms: 0,
-                });
-                state.selected_step = pos;
+                };
+                state.selected_step = insert_step_after_selection(state, idx, step);
                 state.set_status(format!("Inserted Wait for '{}'", fg));
             } else {
                 state.set_status("No foreground process detected");
