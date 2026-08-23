@@ -158,10 +158,13 @@ pub struct AppState {
     // Foreground process (updated each frame)
     pub foreground_process: Option<String>,
 
+    /// Set when the config file could not be read at startup; blocks autosave
+    /// so a failed read is never overwritten by a save.
+    pub config_read_failed: bool,
+
     // Recording
     pub recording_steps: Vec<MacroStep>,
     pub recording_last_instant: Option<Instant>,
-    pub recording_start: Option<Instant>,
     pub recording_name: String,
     pub recording_pressed_keys: HashSet<u16>,
     pub recording_pressed_mouse: HashSet<MouseButton>,
@@ -214,7 +217,6 @@ pub struct AppState {
     pub undo_stack: Vec<Vec<Macro>>, // snapshots of macros list
 
     // Stats
-    pub macro_activations: std::collections::HashMap<i32, u32>, // vk -> activation count this session
 
     // Renaming
     pub renaming: bool,
@@ -255,9 +257,9 @@ impl AppState {
             speed_multiplier: 1.0,
             audio_enabled: true,
             foreground_process: None,
+            config_read_failed: false,
             recording_steps: Vec::new(),
             recording_last_instant: None,
-            recording_start: None,
             recording_name: String::new(),
             recording_pressed_keys: HashSet::new(),
             recording_pressed_mouse: HashSet::new(),
@@ -291,7 +293,6 @@ impl AppState {
             selected_chain: 0,
             help_scroll: 0,
             undo_stack: Vec::new(),
-            macro_activations: std::collections::HashMap::new(),
             renaming: false,
             rename_buf: String::new(),
             text_cursor: 0,

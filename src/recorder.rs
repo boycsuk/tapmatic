@@ -9,7 +9,6 @@ pub fn start_recording(state: &mut AppState) {
     state.recording_name = state.next_macro_name();
     state.recording_steps.clear();
     state.recording_last_instant = None;
-    state.recording_start = Some(Instant::now());
     state.recording_pressed_keys.clear();
     state.recording_pressed_mouse.clear();
     state.recording_paused = false;
@@ -29,7 +28,6 @@ pub fn stop_recording(state: &mut AppState) -> Macro {
     let mut mac = Macro::new(state.recording_name.clone());
     mac.steps = std::mem::take(&mut state.recording_steps);
     state.recording_last_instant = None;
-    state.recording_start = None;
     state.recording_pressed_keys.clear();
     state.recording_pressed_mouse.clear();
     state.recording_paused = false;

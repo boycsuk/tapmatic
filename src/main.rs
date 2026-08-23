@@ -33,6 +33,12 @@ pub const MAIN_BUTTONS: &[&str] = &[
     "Record", "Edit", "Copy", "Delete", "Save", "Toggle", "Mute", "Quit",
 ];
 
+/// Delay multiplier bounds. Values below 1.0 speed playback up, above slow it
+/// down; the UI presents the reciprocal.
+const MIN_SPEED_MULTIPLIER: f64 = 0.25;
+const MAX_SPEED_MULTIPLIER: f64 = 4.0;
+const SPEED_MULTIPLIER_STEP: f64 = 0.25;
+
 fn main() {
     // Panic handler: restore terminal before printing panic info
     let default_hook = std::panic::take_hook();
@@ -43,7 +49,10 @@ fn main() {
 
     input::begin_high_res_timer();
 
-    let config = persistence::load();
+    let (config, load_error) = match persistence::load() {
+        persistence::LoadOutcome::Loaded(c) | persistence::LoadOutcome::Fresh(c) => (c, None),
+        persistence::LoadOutcome::Corrupt(reason) => (persistence::AppConfig::default(), Some(reason)),
+    };
 
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
     let (cmd_tx, cmd_rx) = mpsc::channel::<ExecutorCommand>();
@@ -54,7 +63,11 @@ fn main() {
     state.macros = config.macros;
     state.audio_enabled = config.audio_enabled;
     state.macros_enabled = config.macros_enabled;
-    state.speed_multiplier = config.speed_multiplier;
+    state.speed_multiplier = config.speed_multiplier.clamp(MIN_SPEED_MULTIPLIER, MAX_SPEED_MULTIPLIER);
+    if let Some(reason) = load_error {
+        state.config_read_failed = true;
+        state.set_status_persistent(format!("Config not loaded ({reason}). Saving is disabled."));
+    }
     AUDIO_ENABLED.store(state.audio_enabled, Ordering::SeqCst);
     MACROS_ENABLED.store(state.macros_enabled, Ordering::SeqCst);
     SPEED_MULTIPLIER.store(state.speed_multiplier.to_bits(), Ordering::SeqCst);
@@ -199,7 +212,6 @@ fn start_macro(
     enforce_exclusive_group(state, &mac, cmd_tx);
     let _ = cmd_tx.send(ExecutorCommand::StartMacro(mac));
     state.set_macro_active(vk, true);
-    *state.macro_activations.entry(vk).or_insert(0) += 1;
     audio::play_activate();
 }
 
@@ -732,8 +744,8 @@ fn handle_key_main(
         }
         KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('-') | KeyCode::Char('0') => {
             state.speed_multiplier = match key {
-                KeyCode::Char('+') | KeyCode::Char('=') => (state.speed_multiplier + 0.25).min(4.0),
-                KeyCode::Char('-') => (state.speed_multiplier - 0.25).max(0.25),
+                KeyCode::Char('+') | KeyCode::Char('=') => (state.speed_multiplier + SPEED_MULTIPLIER_STEP).min(MAX_SPEED_MULTIPLIER),
+                KeyCode::Char('-') => (state.speed_multiplier - SPEED_MULTIPLIER_STEP).max(MIN_SPEED_MULTIPLIER),
                 _ => 1.0,
             };
             SPEED_MULTIPLIER.store(state.speed_multiplier.to_bits(), Ordering::SeqCst);
@@ -816,14 +828,24 @@ fn request_quit(state: &mut AppState) {
     }
 }
 
-fn autosave(state: &AppState) {
+/// Persist the current state, reporting any failure in the status bar.
+///
+/// Does nothing when the config on disk could not be parsed at startup, so a
+/// save never overwrites a file we failed to read.
+fn autosave(state: &mut AppState) {
+    if state.config_read_failed {
+        state.set_status_persistent("Not saving: config file unreadable at startup");
+        return;
+    }
     let config = persistence::AppConfig {
         audio_enabled: state.audio_enabled,
         macros_enabled: state.macros_enabled,
         speed_multiplier: state.speed_multiplier,
         macros: state.macros.clone(),
     };
-    let _ = persistence::save(&config);
+    if let Err(e) = persistence::save(&config) {
+        state.set_status_persistent(format!("Save failed: {e}"));
+    }
 }
 
 fn handle_key_config(
