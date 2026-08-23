@@ -33,6 +33,12 @@ pub const MAIN_BUTTONS: &[&str] = &[
     "Record", "Edit", "Copy", "Delete", "Save", "Toggle", "Mute", "Quit",
 ];
 
+/// How long a config change may sit in memory before being written to disk.
+const SAVE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Poll the foreground window every N frames (~4x/second at 60fps).
+const FOREGROUND_POLL_FRAMES: u32 = 15;
+
 /// Delay multiplier bounds. Values below 1.0 speed playback up, above slow it
 /// down; the UI presents the reciprocal.
 const MIN_SPEED_MULTIPLIER: f64 = 0.25;
@@ -94,6 +100,9 @@ fn main() {
     let result = run_app(&mut terminal, &mut state, &event_rx, &cmd_tx, &hotkey_config);
     ratatui::restore();
 
+    // run_app flushes on a clean quit; this covers the error path.
+    flush_pending_save(&mut state);
+
     RUNNING.store(false, Ordering::SeqCst);
     let _ = cmd_tx.send(ExecutorCommand::StopAll);
     input::end_high_res_timer();
@@ -113,9 +122,19 @@ fn run_app(
     let mut frame_count: u32 = 0;
     let mut cpu_snapshot = input::get_cpu_usage_snapshot();
     let app_start = std::time::Instant::now();
+    let mut last_save = std::time::Instant::now();
 
     loop {
-        state.foreground_process = input::get_foreground_process_name();
+        // The foreground window changes at human speed; polling it every frame
+        // costs four syscalls and a handle open/close for nothing.
+        if frame_count.is_multiple_of(FOREGROUND_POLL_FRAMES) {
+            state.foreground_process = input::get_foreground_process_name();
+        }
+
+        if state.unsaved_changes && last_save.elapsed() >= SAVE_INTERVAL {
+            flush_pending_save(state);
+            last_save = std::time::Instant::now();
+        }
 
         // Update system stats every ~1 second (60 frames)
         frame_count += 1;
@@ -147,6 +166,7 @@ fn run_app(
         terminal.draw(|f| ui::draw(f, state))?;
 
         if state.should_quit {
+            flush_pending_save(state);
             return Ok(());
         }
 
@@ -828,9 +848,21 @@ fn request_quit(state: &mut AppState) {
 ///
 /// Does nothing when the config on disk could not be parsed at startup, so a
 /// save never overwrites a file we failed to read.
+/// Mark the config dirty so the event loop flushes it shortly.
+///
+/// Called from every mutating key handler, so it must not touch the disk: the
+/// write happens in `flush_pending_save`, at most once per `SAVE_INTERVAL`.
 fn autosave(state: &mut AppState) {
     if state.config_read_failed {
         state.set_status_persistent("Not saving: config file unreadable at startup");
+        return;
+    }
+    state.unsaved_changes = true;
+}
+
+/// Write the config if it is dirty, reporting failures in the status bar.
+fn flush_pending_save(state: &mut AppState) {
+    if !state.unsaved_changes || state.config_read_failed {
         return;
     }
     let config = persistence::AppConfig {
@@ -839,8 +871,12 @@ fn autosave(state: &mut AppState) {
         speed_multiplier: state.speed_multiplier,
         macros: state.macros.clone(),
     };
-    if let Err(e) = persistence::save(&config) {
-        state.set_status_persistent(format!("Save failed: {e}"));
+    match persistence::save(&config) {
+        Ok(()) => state.unsaved_changes = false,
+        Err(e) => {
+            state.unsaved_changes = false;
+            state.set_status_persistent(format!("Save failed: {e}"));
+        }
     }
 }
 
@@ -1598,6 +1634,33 @@ fn update_hotkey_config(state: &AppState, config: &Arc<Mutex<HotkeyConfig>>) {
 mod tests {
     use super::*;
 
+
+    // ── Deferred saving ──
+
+    #[test]
+    fn autosave_marks_dirty_without_touching_the_disk() {
+        let mut s = AppState::new();
+        assert!(!s.unsaved_changes);
+        autosave(&mut s);
+        assert!(s.unsaved_changes, "the event loop flushes it later");
+    }
+
+    #[test]
+    fn autosave_is_inert_when_the_config_failed_to_load() {
+        let mut s = AppState::new();
+        s.config_read_failed = true;
+        autosave(&mut s);
+        assert!(!s.unsaved_changes, "never overwrite a config we could not read");
+    }
+
+    #[test]
+    fn flush_is_a_noop_when_nothing_changed() {
+        let mut s = AppState::new();
+        s.config_read_failed = true;
+        s.unsaved_changes = true;
+        flush_pending_save(&mut s);
+        assert!(s.unsaved_changes, "blocked config keeps the flag, writes nothing");
+    }
 
     // ── Step editor key handling ──
     //

@@ -164,6 +164,9 @@ pub struct AppState {
     /// so a failed read is never overwritten by a save.
     pub config_read_failed: bool,
 
+    /// Set by `autosave`, cleared once the event loop writes to disk.
+    pub unsaved_changes: bool,
+
     // Recording
     pub recording_steps: Vec<MacroStep>,
     pub recording_last_instant: Option<Instant>,
@@ -260,6 +263,7 @@ impl AppState {
             audio_enabled: true,
             foreground_process: None,
             config_read_failed: false,
+            unsaved_changes: false,
             recording_steps: Vec::new(),
             recording_last_instant: None,
             recording_name: String::new(),
