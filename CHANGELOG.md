@@ -13,8 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A README covering what the app does, how to build and run it, the recording
   and playback keys, and the per-macro options.
-- MIT LICENSE file, plus `license`, `description` and `repository` metadata in
-  `Cargo.toml`.
+- MIT LICENSE file, plus `license`, `description`, `repository` and
+  `rust-version` metadata in `Cargo.toml`.
 
 ### Changed
 

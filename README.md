@@ -26,7 +26,7 @@ if you would rather not build it.
 
 - Windows. The input layer is Win32 (`SendInput`, `PostMessage`,
   `GetAsyncKeyState`); on other platforms the crate compiles but no macro runs.
-- Rust 1.85+ (edition 2024) to build from source.
+- Rust 1.87+ to build from source.
 
 ## Usage
 
