@@ -7,6 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The step editor's "press a key" capture accepts mouse buttons again, as its
+  prompts always claimed: replacing an action or inserting a step pair now
+  binds left/middle/right clicks. Hotkey binding stays keyboard-only (a click
+  on the UI must not become the macro's trigger), and the X side buttons are
+  excluded everywhere - they were capturable as hotkeys and then fired the
+  macro on every side-button click anywhere.
+- Selecting Window send mode without a bound process now warns in the status
+  bar, and the macro table marks the combination with `[W?]`: without a
+  process, Window mode silently runs as global focus-dependent input.
+
+### Changed
+
+- Comment and doc hygiene from the audit: three stale doc comments that
+  described a different function than the one they sat on are fixed, the
+  arm-label and banner comments that restated their code are gone, and the
+  items that carry real contracts now have rustdoc - the nine cross-thread
+  statics (including `SPEED_MULTIPLIER`'s f64-bits encoding), the view state
+  machine and executor command protocol, the serialized config vocabulary
+  (`RepetitionMode`'s three modes were documented nowhere), the input
+  facade's injection-refused bool, and `ui::draw`.
+- Confirmed semantic duplication folded onto single owners: the stop-recording
+  transition (QuickRecordToggle now routes through RecordStop), the Config
+  entry path (which also inherited a stale tab when opened after a recording),
+  the recorder's capture reset, the audio playback scaffold, the insert-after-
+  selection rule, the config view's arrow-key motion, and the speed display
+  (the status bar and toast could show different precision). Behavioral magic
+  numbers got names (mouse VK codes, mode settle window, status TTL, undo cap,
+  stop-condition defaults, default mouse threshold).
+- Window-mode posts now report `PostMessageW` failures, so the executor's
+  retry loop covers a failed post instead of reporting success while sending
+  nothing; `get_cursor_pos` failure is now distinguishable from a cursor at
+  (0,0), so recording no longer writes a jump-to-origin step when the query
+  fails; and the console title is rebuilt on the existing poll cadence
+  instead of every frame.
+
+### Security
+
+- CI/release workflows: third-party actions are pinned to commit SHAs (with
+  Dependabot proposing bumps), CI's token is now explicitly read-only, the
+  release binary is built without a cache so it is always a clean build of
+  the tagged commit, and every release now ships a `SHA256SUMS.txt`.
+
+### Fixed
+
+- A macro name (or group/chain/process string) containing control characters
+  reached the console title through crossterm's `SetTitle`, which emits a raw
+  OSC sequence: a crafted shared config could inject arbitrary terminal
+  escape sequences. Control characters are now stripped at the load clamp
+  (TypeText payloads excepted - there they are typed input).
+- The config file was read and parsed with no size limit, so a multi-gigabyte
+  `.tapmatic.json` caused unbounded memory use at every startup. Files over
+  64 MB are now refused before parsing and reported as corrupt.
+- A failed autosave cleared the dirty flag, so the edits were never retried
+  and the quit-path flushes wrote nothing: one transient write failure lost
+  the session. The flag now survives failures and the save retries.
+- Deleting or renaming a macro left other macros' `chain_macro` references
+  dangling, silently breaking their chains; a chain to a missing name also
+  failed with no feedback. Renames now retarget references, deletes clear
+  them (reporting how many), and a dangling chain is named in the status bar.
+- A pending delete confirmation survived a quick recording that changed the
+  macro list, so Enter deleted a different macro than the prompt named; the
+  commit also bypassed an active search filter, desyncing the selection.
+  Committing a recording now cancels the prompt and clears the filter.
+- Starting a macro when the executor thread was dead still marked it ACTIVE
+  and played the activation sound, misreporting forever.
+- The legacy-migration guard against overwriting a config that appeared
+  mid-migration used a non-atomic exists-then-rename; the target is now
+  reserved atomically.
+- The first run (or a legacy migration) now reports itself in the status bar
+  instead of being indistinguishable from a normal load.
+- In-session edits bypassed every load-time bound: a huge mouse-jitter or
+  scroll-clicks value overflowed the executor's i32 math (garbage input
+  injected system-wide in release builds), and oversized names, TypeText
+  payloads, recordings and macro counts were silently truncated at the next
+  launch. Config commits now run the same clamp as the load path, the
+  recorder stops at the step cap, and copy/record refuse to exceed the macro
+  cap. The wheel-delta math also saturates as defense in depth.
+- A macro with zero steps was startable and became an unstoppable busy loop:
+  no iteration ever read the stop flag, `stop()` joined forever and quitting
+  hung the app. Empty macros are now refused at start and the executor loop
+  checks the stop flag every cycle.
+- Copying or duplicating steps with a selection anchor left over from a
+  longer macro panicked: the anchor was never reset when entering the step
+  editor and the selection range was not clamped to the step list.
+- Opening a macro's config with a text cursor left over from a longer buffer
+  (e.g. the search field) panicked on Backspace or Ctrl+Left: `enter_config`
+  never reset the cursor.
+
 ## [0.1.0] - 2026-08-23
 
 ### Fixed

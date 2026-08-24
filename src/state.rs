@@ -5,6 +5,7 @@ use std::sync::mpsc;
 
 use crate::macro_def::{KeyAction, Macro, MacroStep, MouseButton};
 
+/// Ordering applied to the macro table by the F3 cycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortMode {
     None,
@@ -12,6 +13,7 @@ pub enum SortMode {
     Hotkey,
 }
 
+/// Which screen has the keyboard; the `usize` payloads index `macros`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum View {
     Main,
@@ -23,6 +25,7 @@ pub enum View {
     Help,                 // help/info screen
 }
 
+/// One editable field of the Config view; `CONFIG_TABS` groups them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigField {
     Name,
@@ -171,6 +174,7 @@ const CONFIG_TAB_ADVANCED: &[ConfigField] = &[
     ConfigField::MouseJitter,
 ];
 
+/// The Config view's tabs: (title, fields shown on that tab).
 pub const CONFIG_TABS: &[(&str, &[ConfigField])] = &[
     ("Basic", CONFIG_TAB_BASIC),
     ("Timing", CONFIG_TAB_TIMING),
@@ -224,8 +228,10 @@ pub enum AppEvent {
     Warning(String),                  // background-thread failure surfaced in the status bar
 }
 
+/// The UI-to-executor protocol; sent over the command channel.
 #[derive(Debug)]
 pub enum ExecutorCommand {
+    /// Run this macro on its own thread until it stops or finishes.
     StartMacro(Macro),
     StopMacro(i32),
     StopAll,
@@ -234,27 +240,24 @@ pub enum ExecutorCommand {
 /// The whole mutable UI-thread state: macros, view, selections, edit buffers
 /// and status reporting.
 pub struct AppState {
-    // Macro list
     pub macros: Vec<Macro>,
     pub selected_macro: usize,
     pub active_macros: Vec<i32>,                         // vk codes of currently running macros
     pub macro_progress: std::collections::HashMap<i32, (u32, u32)>, // vk -> (reps, elapsed_secs)
 
-    // View
     pub view: View,
     pub should_quit: bool,
 
-    // Global toggle
+    /// Master kill switch: no macro may start or keep running when false.
     pub macros_enabled: bool,
     /// Delay multiplier applied to every step: values above 1.0 slow playback
     /// down, below 1.0 speed it up. The UI displays its reciprocal, so a stored
     /// 0.25 is shown as "x4.00".
     pub speed_multiplier: f64,
 
-    // Audio
     pub audio_enabled: bool,
 
-    // Foreground process (updated each frame)
+    /// Refreshed by the event loop on the foreground-poll cadence.
     pub foreground_process: Option<String>,
 
     /// Set when the config file could not be read at startup; blocks autosave
@@ -264,7 +267,6 @@ pub struct AppState {
     /// Set by `autosave`, cleared once the event loop writes to disk.
     pub unsaved_changes: bool,
 
-    // Recording
     pub recording_steps: Vec<MacroStep>,
     pub recording_last_instant: Option<Instant>,
     pub recording_name: String,
@@ -274,7 +276,6 @@ pub struct AppState {
     pub recording_mouse_moves: bool,
     pub mouse_move_threshold: u32, // min pixels to record a move (default 5)
 
-    // Config
     pub config_field: ConfigField,
     pub config_tab: usize,
     pub config_input_buf: String,
@@ -282,7 +283,6 @@ pub struct AppState {
     pub awaiting_require_held: bool,
     pub config_macro_backup: Option<Macro>,
 
-    // Step editor
     pub selected_step: usize,
     pub editing_step_delay: bool,
     pub step_delay_buf: String,
@@ -295,33 +295,30 @@ pub struct AppState {
     pub selection_anchor: Option<usize>, // start of multi-select range
     pub clipboard_steps: Vec<MacroStep>,
 
-    // Main view
     pub selected_button: usize,
     pub search_query: String,
     pub searching: bool,
     pub sort_mode: SortMode,
 
-    // Process picker
     pub process_list: Vec<(String, String)>, // (exe_name, window_title)
     pub selected_process: usize,
 
-    // Chain picker
     pub chain_list: Vec<String>, // names of macros available to chain
     pub selected_chain: usize,
 
-    // Status message: (text, timestamp, persistent)
+    /// (text, shown-at, persistent); non-persistent entries expire after
+    /// `STATUS_MESSAGE_TTL_SECS`.
     pub status_message: Option<(String, Instant, bool)>,
 
-    // Help
     pub help_scroll: u16,
 
-    // Undo
-    pub undo_stack: Vec<Vec<Macro>>, // snapshots of macros list
+    /// Snapshots of the whole macro list, capped at `UNDO_STACK_CAP`.
+    pub undo_stack: Vec<Vec<Macro>>,
 
     pub renaming: bool,
     pub rename_buf: String,
 
-    // Text cursor position for editable fields
+    /// Cursor position, in chars, into whichever text buffer is being edited.
     pub text_cursor: usize,
 
     pub console_hidden: bool,
@@ -339,6 +336,11 @@ pub struct AppState {
     pub event_tx: Option<mpsc::Sender<AppEvent>>,
 
 }
+
+/// Non-persistent status messages disappear after this many seconds.
+const STATUS_MESSAGE_TTL_SECS: u64 = 3;
+/// Snapshots kept for F-key undo; each one clones the whole macro list.
+const UNDO_STACK_CAP: usize = 20;
 
 impl AppState {
     pub fn new() -> Self {
@@ -362,7 +364,7 @@ impl AppState {
             recording_pressed_mouse: HashSet::new(),
             recording_paused: false,
             recording_mouse_moves: false,
-            mouse_move_threshold: 5,
+            mouse_move_threshold: crate::DEFAULT_MOUSE_MOVE_THRESHOLD,
             config_field: ConfigField::Name,
             config_tab: 0,
             config_input_buf: String::new(),
@@ -421,9 +423,17 @@ impl AppState {
 
     pub fn clear_stale_status(&mut self) {
         if let Some((_, t, persistent)) = &self.status_message
-            && !persistent && t.elapsed().as_secs() >= 3 {
+            && !persistent && t.elapsed().as_secs() >= STATUS_MESSAGE_TTL_SECS {
                 self.status_message = None;
             }
+    }
+
+    /// The user-facing speed factor, or `None` at normal speed.
+    ///
+    /// `speed_multiplier` scales delays (0.5 = half the delay), so the number
+    /// people think of as "speed" is its reciprocal.
+    pub fn speed_display(&self) -> Option<f64> {
+        ((self.speed_multiplier - 1.0).abs() > 0.01).then(|| 1.0 / self.speed_multiplier)
     }
 
     pub fn is_macro_active(&self, vk: i32) -> bool {
@@ -548,7 +558,7 @@ impl AppState {
     }
 
     pub fn push_undo(&mut self) {
-        if self.undo_stack.len() >= 20 {
+        if self.undo_stack.len() >= UNDO_STACK_CAP {
             self.undo_stack.remove(0);
         }
         self.undo_stack.push(self.macros.clone());
@@ -564,11 +574,15 @@ impl AppState {
         }
     }
 
-    pub fn step_selection_range(&self) -> (usize, usize) {
+    pub fn step_selection_range(&self, step_count: usize) -> (usize, usize) {
+        let last = step_count.saturating_sub(1);
         if let Some(anchor) = self.selection_anchor {
-            (anchor.min(self.selected_step), anchor.max(self.selected_step))
+            (
+                anchor.min(self.selected_step).min(last),
+                anchor.max(self.selected_step).min(last),
+            )
         } else {
-            (self.selected_step, self.selected_step)
+            (self.selected_step.min(last), self.selected_step.min(last))
         }
     }
 
@@ -845,7 +859,7 @@ mod tests {
     fn step_selection_range_no_anchor() {
         let mut s = AppState::new();
         s.selected_step = 5;
-        assert_eq!(s.step_selection_range(), (5, 5));
+        assert_eq!(s.step_selection_range(10), (5, 5));
     }
 
     #[test]
@@ -853,11 +867,24 @@ mod tests {
         let mut s = AppState::new();
         s.selected_step = 7;
         s.selection_anchor = Some(3);
-        assert_eq!(s.step_selection_range(), (3, 7));
+        assert_eq!(s.step_selection_range(10), (3, 7));
 
         s.selected_step = 1;
         s.selection_anchor = Some(5);
-        assert_eq!(s.step_selection_range(), (1, 5));
+        assert_eq!(s.step_selection_range(10), (1, 5));
+    }
+
+    #[test]
+    fn step_selection_range_clamps_stale_anchor() {
+        // Anchor left over from a longer macro must not index past the list.
+        let mut s = AppState::new();
+        s.selected_step = 7;
+        s.selection_anchor = Some(3);
+        assert_eq!(s.step_selection_range(2), (1, 1));
+        s.selection_anchor = None;
+        s.selected_step = 9;
+        assert_eq!(s.step_selection_range(2), (1, 1));
+        assert_eq!(s.step_selection_range(0), (0, 0));
     }
 
     #[test]

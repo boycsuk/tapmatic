@@ -12,10 +12,7 @@ use crate::{audio, input, RECORDING, RECORD_MOUSE_MOVES};
 pub fn start_recording(state: &mut AppState) {
     state.recording_name = state.next_macro_name();
     state.recording_steps.clear();
-    state.recording_last_instant = None;
-    state.recording_pressed_keys.clear();
-    state.recording_pressed_mouse.clear();
-    state.recording_paused = false;
+    reset_capture_bookkeeping(state);
     state.view = View::Recording;
     RECORDING.store(true, Ordering::SeqCst);
     if let Some(ref tx) = state.event_tx {
@@ -36,12 +33,18 @@ pub fn stop_recording(state: &mut AppState) -> Macro {
 
     let mut mac = Macro::new(state.recording_name.clone());
     mac.steps = std::mem::take(&mut state.recording_steps);
+    reset_capture_bookkeeping(state);
+    // Mouse-move tracking is opt-in per recording; only stop clears it.
+    state.recording_mouse_moves = false;
+    mac
+}
+
+/// Clear the per-recording capture state shared by start and stop.
+fn reset_capture_bookkeeping(state: &mut AppState) {
     state.recording_last_instant = None;
     state.recording_pressed_keys.clear();
     state.recording_pressed_mouse.clear();
     state.recording_paused = false;
-    state.recording_mouse_moves = false;
-    mac
 }
 
 /// Pause or resume capture, discarding the time spent paused.
@@ -89,7 +92,10 @@ pub fn process_record_event(state: &mut AppState, action: KeyAction, instant: In
     };
 
     state.recording_last_instant = Some(instant);
-    state.recording_steps.push(MacroStep { action, delay_ms });
+    // Past this the load clamp would silently drop the tail at next launch.
+    if state.recording_steps.len() < crate::macro_def::MAX_STEPS {
+        state.recording_steps.push(MacroStep { action, delay_ms });
+    }
 }
 
 #[cfg(test)]

@@ -4,9 +4,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::input;
-use crate::macro_def::{KeyAction, MouseButton, RepetitionMode};
+use crate::macro_def::{KeyAction, MouseButton, RepetitionMode, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2};
 use crate::state::AppEvent;
-use crate::{AWAITING_HOTKEY, MOUSE_MOVE_THRESHOLD, QUICK_RECORD, RECORDING, RECORD_MOUSE_MOVES, RUNNING};
+use crate::{AWAITING_HOTKEY, CAPTURE_MOUSE_BUTTONS, MOUSE_MOVE_THRESHOLD, QUICK_RECORD, RECORDING, RECORD_MOUSE_MOVES, RUNNING};
 
 /// Bound hotkeys shared between the UI thread (writer) and the scan loop.
 pub struct HotkeyConfig {
@@ -23,6 +23,8 @@ impl HotkeyConfig {
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const VK_ESCAPE: i32 = 0x1B;
+/// Polls (at POLL_INTERVAL) spent re-snapshotting keys after a mode change.
+const MODE_SETTLE_POLLS: u32 = 15;
 const VK_MENU: i32 = 0x12;
 const VK_Z: i32 = 0x5A;
 const VK_F1: i32 = 0x70;
@@ -99,7 +101,9 @@ pub fn hotkey_loop(tx: mpsc::Sender<AppEvent>, config: Arc<Mutex<HotkeyConfig>>)
 
         if mode != last_mode {
             last_mode = mode;
-            for _ in 0..15 {
+            // Re-snapshot key state for a settle window so the keystroke that
+            // triggered the mode change does not leak into the new mode.
+            for _ in 0..MODE_SETTLE_POLLS {
                 snapshot_all_keys(&mut prev_state);
                 thread::sleep(POLL_INTERVAL);
                 if !RUNNING.load(Ordering::SeqCst) {
@@ -125,11 +129,22 @@ fn snapshot_all_keys(prev_state: &mut [bool; 256]) {
     }
 }
 
+/// Whether `vk` must be ignored during a "press a key" capture.
+///
+/// Clicking the UI while binding a hotkey must not bind the macro to a mouse
+/// button, which would then fire on every click anywhere. Step captures DO
+/// accept LMB/RMB/MMB; the X side buttons never pass (unbindable for the same
+/// reason, and they have no step mapping).
+fn capture_excluded(vk: i32, capture_mouse: bool) -> bool {
+    vk == VK_ESCAPE
+        || (!capture_mouse && matches!(vk, VK_LBUTTON | VK_RBUTTON | VK_MBUTTON))
+        || matches!(vk, VK_XBUTTON1 | VK_XBUTTON2)
+}
+
 fn capture_scan(tx: &mpsc::Sender<AppEvent>, prev_state: &mut [bool; 256]) {
+    let capture_mouse = CAPTURE_MOUSE_BUTTONS.load(Ordering::SeqCst);
     for vk in 0x01i32..=0xFE {
-        // Clicking the UI during "press a key" must not bind the macro to a
-        // mouse button, which would then fire on every click anywhere.
-        if vk == VK_ESCAPE || matches!(vk, 0x01 | 0x02 | 0x04) {
+        if capture_excluded(vk, capture_mouse) {
             continue;
         }
         if key_edge(vk, prev_state) == Edge::Released {
@@ -168,10 +183,9 @@ fn record_scan(
 
     let now = Instant::now();
 
-    // Continuous mouse movement recording
-    if RECORD_MOUSE_MOVES.load(Ordering::SeqCst) {
-        let pos = input::get_cursor_pos();
-        if pos != *last_mouse_pos {
+    if RECORD_MOUSE_MOVES.load(Ordering::SeqCst)
+        && let Some(pos) = input::get_cursor_pos()
+        && pos != *last_mouse_pos {
             let threshold = MOUSE_MOVE_THRESHOLD.load(Ordering::Relaxed) as i32;
             let dx = (pos.0 - last_mouse_pos.0).abs();
             let dy = (pos.1 - last_mouse_pos.1).abs();
@@ -179,19 +193,27 @@ fn record_scan(
                 let _ = tx.send(AppEvent::RecordKey(KeyAction::MouseMove(pos.0, pos.1), now));
                 *last_mouse_pos = pos;
             }
-        }
     }
 
-    // Mouse buttons (0x01=LMB, 0x02=RMB, 0x04=MMB)
+    record_button_edges(tx, prev_state, last_mouse_pos, now);
+}
+
+fn record_button_edges(
+    tx: &mpsc::Sender<AppEvent>,
+    prev_state: &mut [bool; 256],
+    last_mouse_pos: &mut (i32, i32),
+    now: Instant,
+) {
     for &(vk, button) in &[
-        (0x01, MouseButton::Left),
-        (0x02, MouseButton::Right),
-        (0x04, MouseButton::Middle),
+        (VK_LBUTTON, MouseButton::Left),
+        (VK_RBUTTON, MouseButton::Right),
+        (VK_MBUTTON, MouseButton::Middle),
     ] {
         match key_edge(vk, prev_state) {
             Edge::Pressed => {
-                // Record mouse position before mouse-down events
-                let pos = input::get_cursor_pos();
+                // Record mouse position before mouse-down events; a failed
+                // query records the click without a position update.
+                let pos = input::get_cursor_pos().unwrap_or(*last_mouse_pos);
                 let mut click_time = now;
                 if pos != *last_mouse_pos {
                     let _ = tx.send(AppEvent::RecordKey(KeyAction::MouseMove(pos.0, pos.1), now));
@@ -261,6 +283,24 @@ fn normal_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_exclusion_gates_mouse_buttons_by_mode() {
+        // Hotkey binding: no mouse button may bind.
+        for vk in [0x01, 0x02, 0x04, 0x05, 0x06] {
+            assert!(capture_excluded(vk, false), "vk {vk:#x} must not bind a hotkey");
+        }
+        // Step capture: the three real buttons pass, the X buttons never do.
+        for vk in [0x01, 0x02, 0x04] {
+            assert!(!capture_excluded(vk, true), "vk {vk:#x} must reach step capture");
+        }
+        for vk in [0x05, 0x06] {
+            assert!(capture_excluded(vk, true));
+        }
+        // Escape always cancels instead of binding; keys always pass.
+        assert!(capture_excluded(VK_ESCAPE, true));
+        assert!(!capture_excluded(0x41, false));
+    }
 
     #[test]
     fn edge_table() {

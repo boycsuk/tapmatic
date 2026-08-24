@@ -30,43 +30,47 @@ mod platform {
             .fade_in(Duration::from_millis((ms / 4).max(5)))
     }
 
-    /// Play a sequence of notes. Each note is (frequency_hz, duration_ms).
-    fn play_notes(notes: &[(f32, u64)], vol: f32) {
+    /// Tail kept on the sink after the last note so it is not cut off.
+    const SINK_TAIL_MS: u64 = 50;
+
+    /// Open the default sink on a background thread and hand it to `feed`,
+    /// which returns how long the thread must live for the sound to finish.
+    fn spawn_playback(feed: impl FnOnce(&rodio::mixer::Mixer) -> u64 + Send + 'static) {
         if !is_enabled() {
             return;
         }
-        let notes: Vec<(f32, u64)> = notes.to_vec();
         std::thread::spawn(move || {
             let Ok(mut handle) = DeviceSinkBuilder::open_default_sink() else {
                 return;
             };
             handle.log_on_drop(false);
-            let mixer = handle.mixer();
+            let ms = feed(handle.mixer());
+            std::thread::sleep(Duration::from_millis(ms + SINK_TAIL_MS));
+        });
+    }
+
+    /// Play a sequence of notes. Each note is (frequency_hz, duration_ms).
+    fn play_notes(notes: &[(f32, u64)], vol: f32) {
+        let notes: Vec<(f32, u64)> = notes.to_vec();
+        spawn_playback(move |mixer| {
+            let mut total = 0;
             for (freq, ms) in &notes {
-                mixer.add(sine(*freq, *ms, vol));
-                std::thread::sleep(Duration::from_millis(*ms));
+                mixer.add(sine(*freq, *ms, vol).delay(Duration::from_millis(total)));
+                total += ms;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            total
         });
     }
 
     /// Play a chord (multiple notes at once).
     fn play_chord(freqs: &[f32], ms: u64, vol: f32) {
-        if !is_enabled() {
-            return;
-        }
         let freqs: Vec<f32> = freqs.to_vec();
-        std::thread::spawn(move || {
-            let Ok(mut handle) = DeviceSinkBuilder::open_default_sink() else {
-                return;
-            };
-            handle.log_on_drop(false);
-            let mixer = handle.mixer();
+        spawn_playback(move |mixer| {
             let per_voice = vol / freqs.len().max(1) as f32;
             for freq in &freqs {
                 mixer.add(sine(*freq, ms, per_voice));
             }
-            std::thread::sleep(Duration::from_millis(ms + 50));
+            ms
         });
     }
 

@@ -1,9 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+/// How a macro's hotkey drives it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepetitionMode {
+    /// One press starts the loop, the next press stops it.
     Toggle,
+    /// Runs only while the hotkey is physically held down.
     HoldToRepeat,
+    /// One press plays the sequence exactly once.
     SingleShot,
 }
 
@@ -33,6 +37,7 @@ impl RepetitionMode {
     }
 }
 
+/// A recordable/replayable mouse button (the X side buttons are excluded).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MouseButton {
     Left,
@@ -40,6 +45,7 @@ pub enum MouseButton {
     Middle,
 }
 
+/// Wheel direction of a `MouseScroll` step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScrollDirection {
     Up,
@@ -69,9 +75,9 @@ impl KeyAction {
     /// Returns None for unrecognized VKs with scancode 0.
     pub fn from_vk(vk: i32, scancode: u16, down: bool) -> Option<Self> {
         match vk {
-            0x01 => Some(if down { Self::MouseDown(MouseButton::Left) } else { Self::MouseUp(MouseButton::Left) }),
-            0x02 => Some(if down { Self::MouseDown(MouseButton::Right) } else { Self::MouseUp(MouseButton::Right) }),
-            0x04 => Some(if down { Self::MouseDown(MouseButton::Middle) } else { Self::MouseUp(MouseButton::Middle) }),
+            VK_LBUTTON => Some(if down { Self::MouseDown(MouseButton::Left) } else { Self::MouseUp(MouseButton::Left) }),
+            VK_RBUTTON => Some(if down { Self::MouseDown(MouseButton::Right) } else { Self::MouseUp(MouseButton::Right) }),
+            VK_MBUTTON => Some(if down { Self::MouseDown(MouseButton::Middle) } else { Self::MouseUp(MouseButton::Middle) }),
             _ if scancode != 0 => Some(if down { Self::KeyDown(scancode) } else { Self::KeyUp(scancode) }),
             _ => None,
         }
@@ -110,7 +116,6 @@ fn mouse_button_name(b: MouseButton) -> &'static str {
 }
 
 fn scancode_name(sc: u16) -> String {
-    // Common scancodes -> readable names
     match sc {
         0x01 => "Esc".into(),
         0x02..=0x0B => {
@@ -168,12 +173,15 @@ fn scancode_name(sc: u16) -> String {
     }
 }
 
+/// One action plus the delay to wait before it when recorded delays replay.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MacroStep {
     pub action: KeyAction,
     pub delay_ms: u64,
 }
 
+/// How steps reach the target: see the variant docs. `Window` needs a bound
+/// process, otherwise execution falls back to the global path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendMode {
     /// SendInput — goes to focused window (works with games)
@@ -191,6 +199,7 @@ impl SendMode {
     }
 }
 
+/// When a looping macro stops on its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopCondition {
     /// Run forever (until manually stopped)
@@ -320,6 +329,7 @@ impl Macro {
     /// shared between users, and nothing else between `serde_json` and the
     /// executor enforces these bounds.
     pub fn clamp_to_valid_ranges(&mut self) {
+        strip_control_chars(&mut self.name);
         truncate_on_char_boundary(&mut self.name, MAX_NAME_LEN);
         self.steps.truncate(MAX_STEPS);
 
@@ -341,12 +351,15 @@ impl Macro {
         }
 
         if let Some(group) = &mut self.exclusive_group {
+            strip_control_chars(group);
             truncate_on_char_boundary(group, MAX_NAME_LEN);
         }
         if let Some(name) = &mut self.chain_macro {
+            strip_control_chars(name);
             truncate_on_char_boundary(name, MAX_NAME_LEN);
         }
         if let Some(process) = &mut self.bound_process {
+            strip_control_chars(process);
             truncate_on_char_boundary(process, MAX_PROCESS_NAME_LEN);
         }
 
@@ -355,7 +368,8 @@ impl Macro {
             match &mut step.action {
                 KeyAction::TypeText(text) => truncate_on_char_boundary(text, MAX_TYPE_TEXT_LEN),
                 KeyAction::WaitForWindow(process) => {
-                    truncate_on_char_boundary(process, MAX_PROCESS_NAME_LEN)
+                    strip_control_chars(process);
+                    truncate_on_char_boundary(process, MAX_PROCESS_NAME_LEN);
                 }
                 KeyAction::MouseScroll(_, clicks) => *clicks = (*clicks).min(MAX_SCROLL_CLICKS),
                 KeyAction::MouseMove(x, y) => {
@@ -371,9 +385,17 @@ impl Macro {
     }
 }
 
+/// Remove control characters: macro names reach the console title via
+/// crossterm's `SetTitle`, which emits a raw OSC sequence with no escaping,
+/// so an embedded BEL/ESC would inject arbitrary terminal escape sequences.
+/// (TypeText payloads are exempt: control characters there are typed input.)
+fn strip_control_chars(s: &mut String) {
+    s.retain(|c| !c.is_control());
+}
+
 /// Truncate to at most `max_bytes`, backing up to the nearest char boundary:
 /// `String::truncate` panics on a byte index inside a multibyte character.
-fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) {
+pub fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) {
     if s.len() <= max_bytes {
         return;
     }
@@ -384,17 +406,23 @@ fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) {
     s.truncate(end);
 }
 
+pub const VK_LBUTTON: i32 = 0x01;
+pub const VK_RBUTTON: i32 = 0x02;
+pub const VK_MBUTTON: i32 = 0x04;
+pub const VK_XBUTTON1: i32 = 0x05;
+pub const VK_XBUTTON2: i32 = 0x06;
+
 /// Virtual-key codes are a byte; 0 means "unbound".
 pub fn is_valid_vk(vk: i32) -> bool {
     (1..=254).contains(&vk)
 }
 
 const MAX_NAME_LEN: usize = 128;
-const MAX_STEPS: usize = 100_000;
-const MAX_TYPE_TEXT_LEN: usize = 10_000;
+pub const MAX_STEPS: usize = 100_000;
+pub const MAX_TYPE_TEXT_LEN: usize = 10_000;
 /// Windows MAX_PATH: process names cannot legitimately exceed it.
 const MAX_PROCESS_NAME_LEN: usize = 260;
-const MAX_SCROLL_CLICKS: u32 = 100;
+pub const MAX_SCROLL_CLICKS: u32 = 100;
 /// Generous bound for multi-monitor virtual desktops that keeps
 /// `coord + jitter` arithmetic far from i32 overflow.
 const MAX_MOUSE_COORD: i32 = 100_000;
@@ -402,7 +430,7 @@ const MAX_MOUSE_COORD: i32 = 100_000;
 pub const MAX_MACROS: usize = 1_000;
 /// One hour: long enough for any real macro, short enough to stay in u64 range
 /// once multiplied by the humanize span.
-const MAX_DELAY_MS: u64 = 60 * 60 * 1000;
+pub const MAX_DELAY_MS: u64 = 60 * 60 * 1000;
 const MAX_MOUSE_JITTER_PX: u32 = 1000;
 
 /// Convert a Windows virtual-key code to a human-readable name.
@@ -857,6 +885,33 @@ mod tests {
         assert_eq!(m.start_delay_ms, max_ms);
         assert_eq!(m.cycle_delay_ms, max_ms);
         assert_eq!(m.mouse_jitter, 1000);
+    }
+
+    #[test]
+    fn clamp_strips_control_chars_from_rendered_strings() {
+        // Names reach the console title unescaped; BEL/ESC must not survive.
+        let mut mac = Macro::new("a\u{7}b\u{1b}]52;c\u{7}".into());
+        mac.exclusive_group = Some("g\u{1b}".into());
+        mac.chain_macro = Some("c\u{7}".into());
+        mac.bound_process = Some("p\r\n".into());
+        mac.steps.push(MacroStep {
+            action: KeyAction::WaitForWindow("w\u{1b}".into()),
+            delay_ms: 0,
+        });
+        mac.steps.push(MacroStep {
+            action: KeyAction::TypeText("keep\ttabs".into()),
+            delay_ms: 0,
+        });
+
+        mac.clamp_to_valid_ranges();
+
+        assert_eq!(mac.name, "ab]52;c");
+        assert_eq!(mac.exclusive_group.as_deref(), Some("g"));
+        assert_eq!(mac.chain_macro.as_deref(), Some("c"));
+        assert_eq!(mac.bound_process.as_deref(), Some("p"));
+        assert!(matches!(&mac.steps[0].action, KeyAction::WaitForWindow(w) if w == "w"));
+        // TypeText is typed input: control characters there are data.
+        assert!(matches!(&mac.steps[1].action, KeyAction::TypeText(t) if t == "keep\ttabs"));
     }
 
     #[test]

@@ -21,11 +21,13 @@ mod platform {
 
     use crate::macro_def::MouseButton;
 
+    /// Whether the key is physically down right now (`GetAsyncKeyState`).
     pub fn is_key_pressed(vk: i32) -> bool {
         let state = unsafe { GetAsyncKeyState(vk) };
         (state as u16 & 0x8000) != 0
     }
 
+    /// Map a virtual-key code to its scancode; 0 when the VK has none.
     pub fn vk_to_scancode(vk: i32) -> u16 {
         unsafe { MapVirtualKeyA(vk as u32, MAP_VIRTUAL_KEY_TYPE(MAPVK_VK_TO_VSC.0)) as u16 }
     }
@@ -71,11 +73,14 @@ mod platform {
         injected as usize == inputs.len()
     }
 
+    /// Inject a key event globally; false when the OS refused the injection
+    /// (UIPI, secure desktop).
     pub fn send_key(scancode: u16, up: bool) -> bool {
         let flags = if up { KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP } else { KEYEVENTF_SCANCODE };
         send(&[keyboard_input(scancode, flags)])
     }
 
+    /// Inject a mouse-button event globally; false when the OS refused it.
     pub fn send_mouse(button: MouseButton, up: bool) -> bool {
         let flags = match (button, up) {
             (MouseButton::Left, false) => MOUSEEVENTF_LEFTDOWN,
@@ -88,16 +93,18 @@ mod platform {
         send(&[mouse_input(0, 0, 0, flags)])
     }
 
+    /// Inject a wheel scroll globally; false when the OS refused it.
     pub fn send_mouse_scroll(up: bool, clicks: u32) -> bool {
-        // Positive delta = scroll up, negative = scroll down.
-        let delta = if up {
-            crate::input::WHEEL_DELTA * clicks as i32
-        } else {
-            -(crate::input::WHEEL_DELTA * clicks as i32)
-        };
+        // Positive delta = scroll up, negative = scroll down. i64 math with a
+        // final clamp: an unclamped clicks value must saturate, not overflow.
+        let magnitude = i64::from(crate::input::WHEEL_DELTA) * i64::from(clicks);
+        let delta = if up { magnitude } else { -magnitude }
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
         send(&[mouse_input(0, 0, delta as u32, MOUSEEVENTF_WHEEL)])
     }
 
+    /// Move the cursor to absolute pixel coordinates; false when refused or
+    /// when the screen size cannot be queried.
     pub fn send_mouse_move(x: i32, y: i32) -> bool {
         // Convert pixel coords to absolute (0..65535) normalized coords
         let (sx, sy) = unsafe {
@@ -110,12 +117,14 @@ mod platform {
         send(&[mouse_input(abs_x, abs_y, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)])
     }
 
-    pub fn get_cursor_pos() -> (i32, i32) {
+    /// The cursor's screen position, or `None` when the query fails (e.g.
+    /// secure desktop) — callers must not mistake failure for (0,0).
+    pub fn get_cursor_pos() -> Option<(i32, i32)> {
         use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
         use windows::Win32::Foundation::POINT;
         let mut pt = POINT { x: 0, y: 0 };
-        unsafe { let _ = GetCursorPos(&mut pt); }
-        (pt.x, pt.y)
+        unsafe { GetCursorPos(&mut pt).ok()? };
+        Some((pt.x, pt.y))
     }
 
     /// Get the exe name (lowercase) of a process by PID.
@@ -146,18 +155,22 @@ mod platform {
         }
     }
 
+    /// Request 1 ms scheduler resolution so short step delays sleep
+    /// accurately; paired with `end_high_res_timer` at shutdown.
     pub fn begin_high_res_timer() {
         unsafe {
             windows::Win32::Media::timeBeginPeriod(1);
         }
     }
 
+    /// Release the resolution requested by `begin_high_res_timer`.
     pub fn end_high_res_timer() {
         unsafe {
             windows::Win32::Media::timeEndPeriod(1);
         }
     }
 
+    /// Show or hide the app's own console window (F12 minimize-to-nothing).
     pub fn set_console_visible(visible: bool) {
         use windows::Win32::System::Console::GetConsoleWindow;
         use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
@@ -234,7 +247,7 @@ mod platform {
     }
 
     /// Send a key event to a specific window via PostMessage (no focus needed).
-    pub fn post_key(hwnd: windows::Win32::Foundation::HWND, scancode: u16, up: bool) {
+    pub fn post_key(hwnd: windows::Win32::Foundation::HWND, scancode: u16, up: bool) -> bool {
         use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyA, MAP_VIRTUAL_KEY_TYPE};
         use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
         use windows::Win32::Foundation::{WPARAM, LPARAM};
@@ -251,12 +264,12 @@ mod platform {
             } else {
                 (WM_KEYDOWN, 1u32 | ((scancode as u32) << 16))
             };
-            let _ = PostMessageW(Some(hwnd), msg, WPARAM(vk), LPARAM(lparam as isize));
+            PostMessageW(Some(hwnd), msg, WPARAM(vk), LPARAM(lparam as isize)).is_ok()
         }
     }
 
     /// Send a mouse button event to a specific window via PostMessage.
-    pub fn post_mouse(hwnd: windows::Win32::Foundation::HWND, button: MouseButton, up: bool) {
+    pub fn post_mouse(hwnd: windows::Win32::Foundation::HWND, button: MouseButton, up: bool) -> bool {
         use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
         use windows::Win32::Foundation::{WPARAM, LPARAM};
 
@@ -273,9 +286,7 @@ mod platform {
             (MouseButton::Middle, false) => WM_MBUTTONDOWN,
             (MouseButton::Middle, true) => WM_MBUTTONUP,
         };
-        unsafe {
-            let _ = PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0));
-        }
+        unsafe { PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0)).is_ok() }
     }
 
     /// Returns (total_time, idle_time) as raw ticks for CPU usage calculation.
@@ -376,7 +387,7 @@ mod platform {
     pub fn send_mouse(_button: MouseButton, _up: bool) -> bool { true }
     pub fn send_mouse_scroll(_up: bool, _clicks: u32) -> bool { true }
     pub fn send_mouse_move(_x: i32, _y: i32) -> bool { true }
-    pub fn get_cursor_pos() -> (i32, i32) { (0, 0) }
+    pub fn get_cursor_pos() -> Option<(i32, i32)> { None }
     pub fn begin_high_res_timer() {}
     pub fn end_high_res_timer() {}
     pub fn set_console_visible(_visible: bool) {}
@@ -527,7 +538,6 @@ mod scroll_hook {
 pub use scroll_hook::start as start_scroll_hook;
 pub use scroll_hook::stop as stop_scroll_hook;
 
-/// Execute a single KeyAction via SendInput (global, needs focus).
 /// Advance the xorshift64 state and return the new value.
 ///
 /// `state` must be nonzero: zero is xorshift's fixed point.
@@ -554,7 +564,8 @@ pub fn execute_action(action: &KeyAction, stop: &std::sync::atomic::AtomicBool) 
     }
 }
 
-/// Execute a MouseMove with jitter applied.
+/// Execute an action, offsetting a MouseMove target by up to ±`jitter` px;
+/// any other action passes through to `execute_action` unchanged.
 pub fn execute_action_with_jitter(
     action: &KeyAction,
     jitter: u32,
@@ -697,27 +708,27 @@ pub fn execute_action_to_process(
             // (PostMessage doesn't support WM_MOUSEWHEEL/WM_MOUSEMOVE reliably)
             KeyAction::MouseScroll(dir, clicks) => {
                 use crate::macro_def::ScrollDirection;
-                send_mouse_scroll(*dir == ScrollDirection::Up, *clicks);
+                send_mouse_scroll(*dir == ScrollDirection::Up, *clicks)
             }
-            KeyAction::MouseMove(x, y) => {
-                send_mouse_move(*x, *y);
-            }
-            KeyAction::WaitForWindow(_) => {} // handled by executor
+            KeyAction::MouseMove(x, y) => send_mouse_move(*x, *y),
+            KeyAction::WaitForWindow(_) => true, // handled by executor
             KeyAction::TypeText(text) => {
                 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR};
                 use windows::Win32::Foundation::{WPARAM, LPARAM};
+                let mut all_posted = true;
                 for ch in text.encode_utf16() {
                     if stop.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
                     }
-                    unsafe {
-                        let _ = PostMessageW(Some(hwnd), WM_CHAR, WPARAM(ch as usize), LPARAM(0));
-                    }
+                    let posted = unsafe {
+                        PostMessageW(Some(hwnd), WM_CHAR, WPARAM(ch as usize), LPARAM(0)).is_ok()
+                    };
+                    all_posted &= posted;
                     std::thread::sleep(std::time::Duration::from_millis(TYPE_TEXT_CHAR_DELAY_MS));
                 }
+                all_posted
             }
         }
-        true
     }
     #[cfg(not(windows))]
     {
