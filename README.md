@@ -53,6 +53,29 @@ and the app says so if you forget one.
 
 Press `?` in the app for the full key reference.
 
+## What to know before you use it
+
+**Recording captures everything, system-wide.** While a recording is running,
+every keypress and click is captured — including in windows that have nothing
+to do with tapmatic. Steps are written to `.tapmatic.json` as plain text, so a
+password typed during a recording ends up in that file readable. The file is
+created with owner-only permissions on Unix, but that is the only protection.
+Press `F1` to pause capture before typing anything private, or `Esc` to stop.
+
+**Replaying synthetic input is against the rules in a lot of places.** Most
+online games, and plenty of other applications, prohibit automated input in
+their terms of service, and enforce it. Getting caught typically means a ban
+of the account, not a warning. That is your call to make, but make it knowing
+the terms you agreed to.
+
+**Humanize and Mouse jitter are anti-detection features.** They exist to blur
+the timing and positional regularity that makes injected input identifiable as
+injected. They are useful for making a macro feel less mechanical, and they are
+also what you would reach for to avoid an automation check. Neither one makes
+replayed input indistinguishable from a person — `SendInput` marks its events
+as injected at the OS level, and anything looking for that flag will find it
+regardless of these settings.
+
 ## Configuration
 
 Macros live in `.tapmatic.json` in your home directory. The file is written

@@ -489,9 +489,21 @@ fn draw_recording(f: &mut Frame, state: &AppState) {
             Span::styled(last_keys, Style::default().fg(CYAN)),
         ]),
         Line::from(""),
+        // The capture is system-wide, not scoped to this window, and the
+        // steps land in the config file as plain text. Someone who starts a
+        // quick recording with Alt+Z and then types into another window has
+        // no other cue that it is still running.
         Line::from(vec![Span::styled(
-            "  Press keys to record. Mouse and keyboard are captured.",
-            Style::default().fg(DIM),
+            "  Capturing ALL keyboard and mouse input system-wide,",
+            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![Span::styled(
+            "  including other windows. Steps are saved to disk as text —",
+            Style::default().fg(RED),
+        )]),
+        Line::from(vec![Span::styled(
+            "  press F1 to pause before typing anything private.",
+            Style::default().fg(RED),
         )]),
     ];
 

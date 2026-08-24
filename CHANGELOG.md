@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Mouse jitter now draws a uniform offset across the configured range. The
+  modulo ran on an `i32` cast of the RNG draw, and `%` keeps the sign of its
+  dividend, so half the draws were negative and the real range was
+  `-2*jitter..=jitter`: a configured ±5 px produced offsets in `-15..=5`,
+  three times the intended spread, biased to one side and double-weighted at
+  exactly `-jitter`. The arithmetic now stays unsigned through the modulo.
+- A `mouse_jitter` above `i32::MAX` no longer overflows the `2*jitter + 1`
+  term — a panic in debug builds, a silent wrap in release. The jitter
+  computation is 64-bit and saturates, and the destination coordinate is added
+  with `saturating_add` so a move near `i32::MAX` cannot wrap to the opposite
+  edge of the desktop.
+- Values entered in the config editor are clamped at the point of entry rather
+  than only when the config is written. Nothing between the editor and the
+  executor enforced the ranges, so an out-of-range value was live for the rest
+  of the session; `mouse_jitter` was the field where that reached arithmetic
+  that could overflow.
+- `StopCondition::AfterSecs` is honoured while Window mode retries a vanished
+  target. Every other wait in the step loop consults the deadline; this retry
+  checked only the stop flag, so a macro whose bound window never came back
+  retried indefinitely past its configured limit.
+
+### Changed
+
+- The recording view states that capture is system-wide and that steps are
+  written to disk as plain text, and points at `F1` to pause. The previous
+  wording ("Mouse and keyboard are captured") did not convey that input from
+  other windows is captured too.
+
+### Added
+
+- `CLAUDE.md`, documenting the thread architecture, the invariants that are
+  load-bearing across modules (scancode prefixes, `Deadline`, `HeldInputs`
+  release-on-drop, the input boundaries) and the known limitations.
+- A README section covering what recording captures, that replaying synthetic
+  input violates many applications' terms of service, and what `humanize` and
+  `mouse_jitter` actually do — and do not do.
+
 ## [0.2.2] - 2026-08-24
 
 ### Fixed
