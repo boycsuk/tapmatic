@@ -416,13 +416,16 @@ fn execute_macro_inner(
                     &mut held.window_target,
                     stop_flag,
                 ) {
-                    if should_stop(stop_flag) {
+                    // Every other wait in this loop consults the deadline;
+                    // without it here an AfterSecs macro whose target window
+                    // never comes back retries forever, well past its limit.
+                    if should_stop(stop_flag) || deadline.expired() {
                         return;
                     }
                     // The cached handle is already gone by now; drop it so the
                     // retry re-resolves instead of failing on a stale one.
                     held.window_target.invalidate();
-                    thread::sleep(Duration::from_millis(50));
+                    thread::sleep(Duration::from_millis(WINDOW_RETRY_POLL_MS));
                 }
             } else {
                 // Same reason as the humanize gate: don't advance the RNG
@@ -486,6 +489,9 @@ fn execute_macro_inner(
 /// How long a bound-process focus answer stays valid before re-querying.
 const FOCUS_RECHECK_INTERVAL: Duration = Duration::from_millis(75);
 
+/// Gap between attempts to re-resolve a Window-mode target that went away.
+const WINDOW_RETRY_POLL_MS: u64 = 50;
+
 fn is_bound_process_focused(bound: &str) -> bool {
     input::get_foreground_process_name()
         .is_some_and(|fg| fg == bound)
@@ -494,6 +500,19 @@ fn is_bound_process_focused(bound: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deadline_in_the_future_has_not_expired() {
+        let future = Deadline(Instant::now().checked_add(Duration::from_secs(60)));
+        assert!(!future.expired());
+    }
+
+    /// `StopCondition::None` and `AfterReps` carry no deadline at all; an
+    /// unconditional `expired()` there would end every macro immediately.
+    #[test]
+    fn an_absent_deadline_never_expires() {
+        assert!(!Deadline(None).expired());
+    }
 
     #[test]
     fn random_delay_stays_within_range() {
