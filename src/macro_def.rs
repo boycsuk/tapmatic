@@ -1,9 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+/// How a macro's hotkey drives it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepetitionMode {
+    /// One press starts the loop, the next press stops it.
     Toggle,
+    /// Runs only while the hotkey is physically held down.
     HoldToRepeat,
+    /// One press plays the sequence exactly once.
     SingleShot,
 }
 
@@ -33,6 +37,7 @@ impl RepetitionMode {
     }
 }
 
+/// A recordable/replayable mouse button (the X side buttons are excluded).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MouseButton {
     Left,
@@ -40,6 +45,7 @@ pub enum MouseButton {
     Middle,
 }
 
+/// Wheel direction of a `MouseScroll` step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScrollDirection {
     Up,
@@ -110,7 +116,6 @@ fn mouse_button_name(b: MouseButton) -> &'static str {
 }
 
 fn scancode_name(sc: u16) -> String {
-    // Common scancodes -> readable names
     match sc {
         0x01 => "Esc".into(),
         0x02..=0x0B => {
@@ -168,12 +173,15 @@ fn scancode_name(sc: u16) -> String {
     }
 }
 
+/// One action plus the delay to wait before it when recorded delays replay.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MacroStep {
     pub action: KeyAction,
     pub delay_ms: u64,
 }
 
+/// How steps reach the target: see the variant docs. `Window` needs a bound
+/// process, otherwise execution falls back to the global path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendMode {
     /// SendInput — goes to focused window (works with games)
@@ -191,6 +199,7 @@ impl SendMode {
     }
 }
 
+/// When a looping macro stops on its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopCondition {
     /// Run forever (until manually stopped)

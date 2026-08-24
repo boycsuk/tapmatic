@@ -5,6 +5,7 @@ use std::sync::mpsc;
 
 use crate::macro_def::{KeyAction, Macro, MacroStep, MouseButton};
 
+/// Ordering applied to the macro table by the F3 cycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortMode {
     None,
@@ -12,6 +13,7 @@ pub enum SortMode {
     Hotkey,
 }
 
+/// Which screen has the keyboard; the `usize` payloads index `macros`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum View {
     Main,
@@ -23,6 +25,7 @@ pub enum View {
     Help,                 // help/info screen
 }
 
+/// One editable field of the Config view; `CONFIG_TABS` groups them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigField {
     Name,
@@ -171,6 +174,7 @@ const CONFIG_TAB_ADVANCED: &[ConfigField] = &[
     ConfigField::MouseJitter,
 ];
 
+/// The Config view's tabs: (title, fields shown on that tab).
 pub const CONFIG_TABS: &[(&str, &[ConfigField])] = &[
     ("Basic", CONFIG_TAB_BASIC),
     ("Timing", CONFIG_TAB_TIMING),
@@ -224,8 +228,10 @@ pub enum AppEvent {
     Warning(String),                  // background-thread failure surfaced in the status bar
 }
 
+/// The UI-to-executor protocol; sent over the command channel.
 #[derive(Debug)]
 pub enum ExecutorCommand {
+    /// Run this macro on its own thread until it stops or finishes.
     StartMacro(Macro),
     StopMacro(i32),
     StopAll,
@@ -234,27 +240,24 @@ pub enum ExecutorCommand {
 /// The whole mutable UI-thread state: macros, view, selections, edit buffers
 /// and status reporting.
 pub struct AppState {
-    // Macro list
     pub macros: Vec<Macro>,
     pub selected_macro: usize,
     pub active_macros: Vec<i32>,                         // vk codes of currently running macros
     pub macro_progress: std::collections::HashMap<i32, (u32, u32)>, // vk -> (reps, elapsed_secs)
 
-    // View
     pub view: View,
     pub should_quit: bool,
 
-    // Global toggle
+    /// Master kill switch: no macro may start or keep running when false.
     pub macros_enabled: bool,
     /// Delay multiplier applied to every step: values above 1.0 slow playback
     /// down, below 1.0 speed it up. The UI displays its reciprocal, so a stored
     /// 0.25 is shown as "x4.00".
     pub speed_multiplier: f64,
 
-    // Audio
     pub audio_enabled: bool,
 
-    // Foreground process (updated each frame)
+    /// Refreshed by the event loop on the foreground-poll cadence.
     pub foreground_process: Option<String>,
 
     /// Set when the config file could not be read at startup; blocks autosave
@@ -264,7 +267,6 @@ pub struct AppState {
     /// Set by `autosave`, cleared once the event loop writes to disk.
     pub unsaved_changes: bool,
 
-    // Recording
     pub recording_steps: Vec<MacroStep>,
     pub recording_last_instant: Option<Instant>,
     pub recording_name: String,
@@ -274,7 +276,6 @@ pub struct AppState {
     pub recording_mouse_moves: bool,
     pub mouse_move_threshold: u32, // min pixels to record a move (default 5)
 
-    // Config
     pub config_field: ConfigField,
     pub config_tab: usize,
     pub config_input_buf: String,
@@ -282,7 +283,6 @@ pub struct AppState {
     pub awaiting_require_held: bool,
     pub config_macro_backup: Option<Macro>,
 
-    // Step editor
     pub selected_step: usize,
     pub editing_step_delay: bool,
     pub step_delay_buf: String,
@@ -295,33 +295,30 @@ pub struct AppState {
     pub selection_anchor: Option<usize>, // start of multi-select range
     pub clipboard_steps: Vec<MacroStep>,
 
-    // Main view
     pub selected_button: usize,
     pub search_query: String,
     pub searching: bool,
     pub sort_mode: SortMode,
 
-    // Process picker
     pub process_list: Vec<(String, String)>, // (exe_name, window_title)
     pub selected_process: usize,
 
-    // Chain picker
     pub chain_list: Vec<String>, // names of macros available to chain
     pub selected_chain: usize,
 
-    // Status message: (text, timestamp, persistent)
+    /// (text, shown-at, persistent); non-persistent entries expire after
+    /// `STATUS_MESSAGE_TTL_SECS`.
     pub status_message: Option<(String, Instant, bool)>,
 
-    // Help
     pub help_scroll: u16,
 
-    // Undo
-    pub undo_stack: Vec<Vec<Macro>>, // snapshots of macros list
+    /// Snapshots of the whole macro list, capped at `UNDO_STACK_CAP`.
+    pub undo_stack: Vec<Vec<Macro>>,
 
     pub renaming: bool,
     pub rename_buf: String,
 
-    // Text cursor position for editable fields
+    /// Cursor position, in chars, into whichever text buffer is being edited.
     pub text_cursor: usize,
 
     pub console_hidden: bool,

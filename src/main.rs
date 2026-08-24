@@ -19,14 +19,29 @@ use hotkey::HotkeyConfig;
 use macro_def::{KeyAction, Macro, MacroStep, RepetitionMode, ScrollDirection, SendMode, StopCondition, vk_name};
 use state::{wrap_nav, AppEvent, AppState, ConfigField, ExecutorCommand, View};
 
+/// App-wide liveness flag; cleared once by quit so every thread exits.
 pub static RUNNING: AtomicBool = AtomicBool::new(true);
+/// True while a recording captures input; read by the hotkey scan thread.
 pub static RECORDING: AtomicBool = AtomicBool::new(false);
+/// Gates every sound; mirrors `AppState::audio_enabled` for the audio threads.
 pub static AUDIO_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Master kill switch mirrored from `AppState::macros_enabled`; macro threads
+/// stop when it goes false.
 pub static MACROS_ENABLED: AtomicBool = AtomicBool::new(true);
+/// True while any "press a key" capture is active: the scan thread swallows
+/// key events and reports them as `HotkeyCaptured` instead of firing macros.
 pub static AWAITING_HOTKEY: AtomicBool = AtomicBool::new(false);
+/// Whether the active capture also accepts mouse buttons (step captures do,
+/// hotkey bindings must not). Meaningless while `AWAITING_HOTKEY` is false.
 pub static CAPTURE_MOUSE_BUTTONS: AtomicBool = AtomicBool::new(false);
-pub static SPEED_MULTIPLIER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x3FF0000000000000); // 1.0f64 as bits
+/// The delay multiplier as raw `f64` bits: readers go through
+/// `f64::from_bits`, writers through `f64::to_bits`. Initialized to 1.0.
+pub static SPEED_MULTIPLIER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0x3FF0000000000000);
+/// Distinguishes an Alt+Z quick recording (commits straight to the list)
+/// from a normal one (opens the config view).
 pub static QUICK_RECORD: AtomicBool = AtomicBool::new(false);
+/// Whether the recorder samples continuous mouse movement.
 pub static RECORD_MOUSE_MOVES: AtomicBool = AtomicBool::new(false);
 pub static MOUSE_MOVE_THRESHOLD: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(DEFAULT_MOUSE_MOVE_THRESHOLD);
@@ -1066,7 +1081,6 @@ fn handle_key_config(
             update_hotkey_config(state, hotkey_config);
         }
 
-        // Navigate fields / tabs
         KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
             apply_config_field(state, idx);
             match key {
@@ -1085,7 +1099,6 @@ fn handle_key_config(
             prefill_config_buf(state, idx);
         }
 
-        // Cycle values with Left/Right
         KeyCode::Left | KeyCode::Right => {
             let forward = key == KeyCode::Right;
             match state.config_field {
@@ -1137,7 +1150,6 @@ fn handle_key_config(
             }
         }
 
-        // Enter = field-specific action
         KeyCode::Enter => {
             apply_config_field(state, idx);
             match state.config_field {
@@ -1172,12 +1184,10 @@ fn handle_key_config(
             }
         }
 
-        // F5 = Save & close
         KeyCode::F(5) => {
             save_config(state, idx, hotkey_config);
         }
 
-        // F1 = Step editor
         KeyCode::F(1) => {
             apply_config_field(state, idx);
             state.selected_step = 0;
@@ -1187,7 +1197,6 @@ fn handle_key_config(
             state.view = View::StepEditor(idx);
         }
 
-        // Text input for editable fields (Char, Backspace, Delete, Home, End, Ctrl+Backspace)
         _ => {
             if state.config_field.is_text_field() || state.config_field.is_numeric_field() {
                 let is_text = state.config_field.is_text_field();
@@ -1446,13 +1455,11 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                 state.selected_step += 1;
             }
         KeyCode::Char('a') | KeyCode::Char('A')
-            // Replace key/button (keeps Down/Up direction)
             if step_count > 0 => {
                 begin_key_capture(state, KeyCapture::StepReplace);
                 state.set_status_persistent("Press a key or mouse button to replace action...");
             }
         KeyCode::Char('s') | KeyCode::Char('S') => {
-            // Swap Down <-> Up
             if let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
                 step.action = match step.action.clone() {
                     KeyAction::KeyDown(sc) => KeyAction::KeyUp(sc),
@@ -1548,7 +1555,6 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             }
         }
         KeyCode::Char('v') | KeyCode::Char('V')
-            // Toggle selection anchor
             if step_count > 0 => {
                 if state.selection_anchor.is_some() {
                     state.selection_anchor = None;
@@ -1645,7 +1651,7 @@ fn handle_key_help(state: &mut AppState, key: KeyCode) {
     }
 }
 
-/// Wrapping navigation: move cursor up/down in a list of `count` items.
+/// Publish the current macros' hotkey bindings to the scan thread.
 fn update_hotkey_config(state: &AppState, config: &Arc<Mutex<HotkeyConfig>>) {
     let entries: Vec<(i32, RepetitionMode)> = state
         .macros

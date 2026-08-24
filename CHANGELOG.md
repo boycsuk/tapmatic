@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Comment and doc hygiene from the audit: three stale doc comments that
+  described a different function than the one they sat on are fixed, the
+  arm-label and banner comments that restated their code are gone, and the
+  items that carry real contracts now have rustdoc - the nine cross-thread
+  statics (including `SPEED_MULTIPLIER`'s f64-bits encoding), the view state
+  machine and executor command protocol, the serialized config vocabulary
+  (`RepetitionMode`'s three modes were documented nowhere), the input
+  facade's injection-refused bool, and `ui::draw`.
 - Confirmed semantic duplication folded onto single owners: the stop-recording
   transition (QuickRecordToggle now routes through RecordStop), the Config
   entry path (which also inherited a stale tab when opened after a recording),

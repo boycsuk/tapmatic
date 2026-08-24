@@ -183,7 +183,6 @@ fn record_scan(
 
     let now = Instant::now();
 
-    // Continuous mouse movement recording
     if RECORD_MOUSE_MOVES.load(Ordering::SeqCst)
         && let Some(pos) = input::get_cursor_pos()
         && pos != *last_mouse_pos {

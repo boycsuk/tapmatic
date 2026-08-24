@@ -22,6 +22,7 @@ const FG_TEXT: Color = Color::Rgb(200, 200, 200);
 const FG_TEXT_DIM: Color = Color::Rgb(180, 180, 180);
 const BG_ACTIVE_ROW: Color = Color::Rgb(180, 120, 40);
 
+/// Render the current view for one frame.
 pub fn draw(f: &mut Frame, state: &mut AppState) {
     match &state.view {
         View::Main => draw_main(f, state),

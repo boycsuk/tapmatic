@@ -322,7 +322,6 @@ fn execute_macro_inner(
                 _ => {}
             }
 
-            // Conditional steps — wait before proceeding
             if let KeyAction::WaitForWindow(ref name) = step.action {
                 let found = || input::get_foreground_process_name().is_some_and(|fg| fg == *name);
                 if wait_until(stop_flag, 50, found) {
