@@ -339,7 +339,7 @@ pub struct AppState {
 
 /// Non-persistent status messages disappear after this many seconds.
 const STATUS_MESSAGE_TTL_SECS: u64 = 3;
-/// Snapshots kept for F-key undo; each one clones the whole macro list.
+/// Snapshots kept for undo (bound to `z`); each clones the whole macro list.
 const UNDO_STACK_CAP: usize = 20;
 
 impl AppState {
@@ -458,8 +458,18 @@ impl AppState {
             .find(|(_, m)| m.hotkey_vk == vk)
     }
 
+    /// A default name no existing macro already uses.
+    ///
+    /// Chains resolve their target by name, so two macros sharing one makes a
+    /// chain silently follow whichever comes first. Counting the list is not
+    /// enough: deleting from the middle makes the next number collide.
     pub fn next_macro_name(&self) -> String {
-        format!("Macro {}", self.macros.len() + 1)
+        let taken: std::collections::HashSet<&str> =
+            self.macros.iter().map(|m| m.name.as_str()).collect();
+        (1..)
+            .map(|n| format!("Macro {}", n))
+            .find(|name| !taken.contains(name.as_str()))
+            .unwrap_or_else(|| "Macro".to_string())
     }
 
     /// Move the selection cursor one row up or down, wrapping at the ends.
@@ -778,8 +788,19 @@ mod tests {
     fn next_macro_name() {
         let s = AppState::new();
         assert_eq!(s.next_macro_name(), "Macro 1");
+        // Unrelated names never block the default sequence.
         let s = state_with_macros(&["A", "B", "C"]);
+        assert_eq!(s.next_macro_name(), "Macro 1");
+        let s = state_with_macros(&["Macro 1", "Macro 2", "Macro 3"]);
         assert_eq!(s.next_macro_name(), "Macro 4");
+    }
+
+    #[test]
+    fn next_macro_name_fills_a_gap_rather_than_colliding() {
+        // Counting the list would return "Macro 3" here and duplicate the
+        // existing one, which silently redirects any chain naming it.
+        let s = state_with_macros(&["Macro 1", "Macro 3"]);
+        assert_eq!(s.next_macro_name(), "Macro 2");
     }
 
     #[test]

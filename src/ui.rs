@@ -29,8 +29,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         View::Recording => draw_recording(f, state),
         View::Config(idx) => draw_config(f, state, *idx),
         View::StepEditor(idx) => draw_step_editor(f, state, *idx),
-        View::ProcessPicker(idx) => draw_process_picker(f, state, *idx),
-        View::ChainPicker(idx) => draw_chain_picker(f, state, *idx),
+        View::ProcessPicker(_) => draw_process_picker(f, state),
+        View::ChainPicker(_) => draw_chain_picker(f, state),
         View::Help => draw_help(f, state),
     }
 }
@@ -889,7 +889,7 @@ fn draw_list_picker(
     render_footer(f, chunks[2], border_style, footer);
 }
 
-fn draw_process_picker(f: &mut Frame, state: &AppState, _idx: usize) {
+fn draw_process_picker(f: &mut Frame, state: &AppState) {
     let total = state.process_list.len();
 
     let rows: Vec<Row> = state
@@ -933,7 +933,7 @@ fn draw_process_picker(f: &mut Frame, state: &AppState, _idx: usize) {
     );
 }
 
-fn draw_chain_picker(f: &mut Frame, state: &AppState, _idx: usize) {
+fn draw_chain_picker(f: &mut Frame, state: &AppState) {
     let total = state.chain_list.len();
 
     let rows: Vec<Row> = state
