@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The step editor's "press a key" capture accepts mouse buttons again, as its
+  prompts always claimed: replacing an action or inserting a step pair now
+  binds left/middle/right clicks. Hotkey binding stays keyboard-only (a click
+  on the UI must not become the macro's trigger), and the X side buttons are
+  excluded everywhere - they were capturable as hotkeys and then fired the
+  macro on every side-button click anywhere.
+- Selecting Window send mode without a bound process now warns in the status
+  bar, and the macro table marks the combination with `[W?]`: without a
+  process, Window mode silently runs as global focus-dependent input.
+
 ### Security
 
 - CI/release workflows: third-party actions are pinned to commit SHAs (with
