@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.1] - 2026-08-24
 
+### Added
+
+- A README covering what the app does, how to build and run it, the recording
+  and playback keys, and the per-macro options.
+- MIT LICENSE file, plus `license`, `description` and `repository` metadata in
+  `Cargo.toml`.
+
 ### Changed
 
 - New application icon: an isometric amber block with a graphite top face and
