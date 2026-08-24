@@ -103,9 +103,27 @@ fn get_speed_multiplier() -> f64 {
     f64::from_bits(SPEED_MULTIPLIER.load(Ordering::Relaxed))
 }
 
+/// Scale a delay by the live speed multiplier, keeping a nonzero delay
+/// nonzero: at 4x every delay under 4ms would otherwise floor to 0 and turn
+/// into a busy send. `apply_humanize` floors at 1ms for the same reason.
 fn apply_speed(delay_ms: u64) -> u64 {
     let mult = get_speed_multiplier();
-    (delay_ms as f64 * mult) as u64
+    let scaled = (delay_ms as f64 * mult) as u64;
+    if delay_ms > 0 { scaled.max(1) } else { 0 }
+}
+
+/// When a macro must stop regardless of what it is waiting for.
+///
+/// `StopCondition::AfterSecs` is otherwise only tested between repetitions, so
+/// a macro parked in `WaitForWindow` runs indefinitely past its configured
+/// limit — the wait helpers consult this to honour it mid-step.
+#[derive(Clone, Copy)]
+struct Deadline(Option<Instant>);
+
+impl Deadline {
+    fn expired(&self) -> bool {
+        self.0.is_some_and(|at| Instant::now() >= at)
+    }
 }
 
 /// Pick a delay within `[min, max]` from the RNG state.
@@ -135,21 +153,37 @@ fn apply_humanize(raw_delay: u64, humanize_ms: u64, rng_state: u64) -> u64 {
     (raw_delay as i64).saturating_add(jitter).max(1) as u64
 }
 
-fn sleep_interruptible(ms: u64, stop_flag: &AtomicBool) -> bool {
+/// Chunk size for interruptible sleeps: small enough that a stop is noticed
+/// promptly, large enough that an hour-long delay is not 720k wakeups.
+const SLEEP_CHUNK_MS: u64 = 25;
+
+fn sleep_interruptible(ms: u64, stop_flag: &AtomicBool, deadline: Deadline) -> bool {
     let mut remaining = ms;
     while remaining > 0 && !should_stop(stop_flag) {
-        let sleep_ms = remaining.min(5);
+        if deadline.expired() {
+            return true;
+        }
+        let sleep_ms = remaining.min(SLEEP_CHUNK_MS);
         thread::sleep(Duration::from_millis(sleep_ms));
         remaining = remaining.saturating_sub(sleep_ms);
     }
     should_stop(stop_flag)
 }
 
-/// Poll `cond` every `poll_ms` until it holds or the macro is stopped.
+/// Poll `cond` every `poll_ms` until it holds, the macro is stopped, or the
+/// deadline passes.
 ///
-/// Returns true when stopped, mirroring `sleep_interruptible`.
-fn wait_until(stop_flag: &AtomicBool, poll_ms: u64, cond: impl Fn() -> bool) -> bool {
+/// Returns true when the macro should end, mirroring `sleep_interruptible`.
+fn wait_until(
+    stop_flag: &AtomicBool,
+    poll_ms: u64,
+    deadline: Deadline,
+    cond: impl Fn() -> bool,
+) -> bool {
     while !should_stop(stop_flag) && !cond() {
+        if deadline.expired() {
+            return true;
+        }
         thread::sleep(Duration::from_millis(poll_ms));
     }
     should_stop(stop_flag)
@@ -264,6 +298,14 @@ fn execute_macro_inner(
     held: &mut HeldInputs,
 ) {
     let is_single = mac.repetition == RepetitionMode::SingleShot;
+    // Derived once: an AfterSecs macro must stop on time even when parked in
+    // a wait, not merely at the next repetition boundary.
+    let deadline = Deadline(match mac.stop_condition {
+        StopCondition::AfterSecs(secs) => {
+            Instant::now().checked_add(Duration::from_secs(secs as u64))
+        }
+        _ => None,
+    });
     let start_time = Instant::now();
     let mut reps: u32 = 0;
     let mut last_progress_secs: u32 = u32::MAX;
@@ -282,7 +324,7 @@ fn execute_macro_inner(
     let mut focus_cache: Option<(Instant, bool)> = None;
 
     if mac.start_delay_ms > 0
-        && sleep_interruptible(mac.start_delay_ms, stop_flag) {
+        && sleep_interruptible(mac.start_delay_ms, stop_flag, deadline) {
             return;
         }
 
@@ -295,10 +337,16 @@ fn execute_macro_inner(
             if should_stop(stop_flag) {
                 return;
             }
+            // Checked per step, not only between repetitions: a single slow
+            // repetition would otherwise overshoot AfterSecs by its whole
+            // duration.
+            if deadline.expired() {
+                return;
+            }
 
             if mac.require_held_vk != 0
                 && !input::is_key_pressed(mac.require_held_vk)
-                && wait_until(stop_flag, 10, || input::is_key_pressed(mac.require_held_vk))
+                && wait_until(stop_flag, 10, deadline, || input::is_key_pressed(mac.require_held_vk))
             {
                 return;
             }
@@ -317,7 +365,7 @@ fn execute_macro_inner(
                         }
                     };
                     if !focused {
-                        if wait_until(stop_flag, 50, || is_bound_process_focused(bound)) {
+                        if wait_until(stop_flag, 50, deadline, || is_bound_process_focused(bound)) {
                             return;
                         }
                         focus_cache = Some((Instant::now(), true));
@@ -343,7 +391,7 @@ fn execute_macro_inner(
             let delay = apply_speed(humanized);
 
             if delay > 0
-                && sleep_interruptible(delay, stop_flag) {
+                && sleep_interruptible(delay, stop_flag, deadline) {
                     return;
                 }
 
@@ -357,7 +405,7 @@ fn execute_macro_inner(
 
             if let KeyAction::WaitForWindow(ref name) = step.action {
                 let found = || input::get_foreground_process_name().is_some_and(|fg| fg == *name);
-                if wait_until(stop_flag, 50, found) {
+                if wait_until(stop_flag, 50, deadline, found) {
                     return;
                 }
             } else if window_mode {
@@ -428,7 +476,7 @@ fn execute_macro_inner(
 
         if mac.cycle_delay_ms > 0 {
             let delay = apply_speed(mac.cycle_delay_ms);
-            if sleep_interruptible(delay, stop_flag) {
+            if sleep_interruptible(delay, stop_flag, deadline) {
                 return;
             }
         }
@@ -495,6 +543,22 @@ mod tests {
     }
 
     #[test]
+    fn apply_speed_scales_and_keeps_zero() {
+        assert_eq!(apply_speed(0), 0);
+        assert_eq!(apply_speed(100), 100, "default multiplier is 1.0");
+    }
+
+    #[test]
+    fn apply_speed_never_floors_a_real_delay_to_zero() {
+        SPEED_MULTIPLIER.store(0.25f64.to_bits(), Ordering::Relaxed);
+        // 3ms * 0.25 truncates to 0, which would turn a paced macro into a
+        // busy send at maximum speed.
+        assert_eq!(apply_speed(3), 1);
+        assert_eq!(apply_speed(0), 0, "a zero delay stays zero");
+        SPEED_MULTIPLIER.store(1.0f64.to_bits(), Ordering::Relaxed);
+    }
+
+    #[test]
     fn finished_is_reported_even_when_the_thread_unwinds() {
         // The UI drops a macro from active_macros on MacroFinished; losing it
         // to a panic leaves the macro ACTIVE with no way to stop it.
@@ -520,9 +584,34 @@ mod tests {
     }
 
     #[test]
-    fn apply_speed_scales_and_keeps_zero() {
-        assert_eq!(apply_speed(0), 0);
-        assert_eq!(apply_speed(100), 100, "default multiplier is 1.0");
+    fn deadline_none_never_expires() {
+        assert!(!Deadline(None).expired());
+    }
+
+    #[test]
+    fn deadline_expires_once_past() {
+        let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        assert!(Deadline(Some(past)).expired());
+        let future = Instant::now() + Duration::from_secs(60);
+        assert!(!Deadline(Some(future)).expired());
+    }
+
+    #[test]
+    fn wait_until_returns_on_an_expired_deadline() {
+        // The macro is not stopped and the condition never holds: without the
+        // deadline this call would never return.
+        let flag = AtomicBool::new(false);
+        let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        assert!(wait_until(&flag, 10, Deadline(Some(past)), || false));
+    }
+
+    #[test]
+    fn sleep_interruptible_returns_on_an_expired_deadline() {
+        let flag = AtomicBool::new(false);
+        let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        assert!(sleep_interruptible(60_000, &flag, Deadline(Some(past))));
+        assert!(started.elapsed() < Duration::from_secs(5), "must not sleep it out");
     }
 
     fn instant_macro(reps: u32) -> Macro {
