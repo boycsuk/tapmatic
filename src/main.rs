@@ -608,10 +608,19 @@ fn capture_key_pair_insert(state: &mut AppState, vk: i32) {
         KeyAction::from_vk(vk, sc, false),
     ) {
         let name = action_down.display_name();
-        let pos = insert_step_after_selection(state, idx, MacroStep { action: action_down, delay_ms: 0 });
-        state.macros[idx].steps.insert(pos + 1, MacroStep { action: action_up, delay_ms: 50 });
-        state.selected_step = pos;
-        state.set_status(format!("Inserted {} (down+up)", name));
+        // down+up is one unit: refuse both or insert both, never a lone press.
+        if !steps_fit(state, idx, 2) {
+            state.set_status(step_limit_status());
+            end_key_capture(state);
+            return;
+        }
+        if let Some(pos) =
+            insert_step_after_selection(state, idx, MacroStep { action: action_down, delay_ms: 0 })
+        {
+            state.macros[idx].steps.insert(pos + 1, MacroStep { action: action_up, delay_ms: 50 });
+            state.selected_step = pos;
+            state.set_status(format!("Inserted {} (down+up)", name));
+        }
     }
     end_key_capture(state);
 }
@@ -1330,15 +1339,22 @@ fn handle_step_editor_modal(
         match handle_modal_input(state, TextField::InsertText, key, mods) {
             ModalOutcome::Committed(text) => {
                 if !text.is_empty() {
+                    // Truncate before building the step: the load-time clamp
+                    // would otherwise trim it at next launch, losing the tail
+                    // silently between sessions.
+                    let mut text = text;
+                    macro_def::truncate_on_char_boundary(&mut text, macro_def::MAX_TYPE_TEXT_LEN);
                     let step = MacroStep {
                         action: KeyAction::TypeText(text.clone()),
                         delay_ms: 0,
                     };
-                    let mut text = text;
-                    macro_def::truncate_on_char_boundary(&mut text, macro_def::MAX_TYPE_TEXT_LEN);
-                    let pos = insert_step_after_selection(state, idx, step);
-                    state.selected_step = pos;
-                    state.set_status(format!("Inserted text: \"{}\"", text));
+                    match insert_step_after_selection(state, idx, step) {
+                        Some(pos) => {
+                            state.selected_step = pos;
+                            state.set_status(format!("Inserted text: \"{}\"", text));
+                        }
+                        None => state.set_status(step_limit_status()),
+                    }
                 }
                 state.inserting_text = false;
             }
@@ -1389,11 +1405,34 @@ fn handle_step_editor_modal(
     false
 }
 
+/// Whether `count` more steps still fit in the macro.
+///
+/// The load-time clamp trims anything past `MAX_STEPS`, so an editor that
+/// accepts more than this writes a file whose tail vanishes at next launch.
+/// Bulk inserts must ask before inserting, not truncate part-way through.
+fn steps_fit(state: &AppState, idx: usize, count: usize) -> bool {
+    state.macros[idx].steps.len() + count <= crate::macro_def::MAX_STEPS
+}
+
 /// Insert a step directly after the current selection, returning its position.
-fn insert_step_after_selection(state: &mut AppState, idx: usize, step: MacroStep) -> usize {
+///
+/// `None` when the macro is already at `MAX_STEPS`; the caller reports it.
+fn insert_step_after_selection(
+    state: &mut AppState,
+    idx: usize,
+    step: MacroStep,
+) -> Option<usize> {
+    if !steps_fit(state, idx, 1) {
+        return None;
+    }
     let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
     state.macros[idx].steps.insert(pos, step);
-    pos
+    Some(pos)
+}
+
+/// Status line for a refused insert, naming the limit that was hit.
+fn step_limit_status() -> String {
+    format!("Step limit reached ({} steps)", crate::macro_def::MAX_STEPS)
 }
 
 fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers) {
@@ -1470,21 +1509,20 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                 state.set_status(format!("Swapped to {}", name));
             }
         }
-        KeyCode::Char('w') | KeyCode::Char('W') => {
+        KeyCode::Char('w') | KeyCode::Char('W') | KeyCode::Char('x') | KeyCode::Char('X') => {
+            let up = matches!(key, KeyCode::Char('w') | KeyCode::Char('W'));
+            let dir = if up { ScrollDirection::Up } else { ScrollDirection::Down };
             let step = MacroStep {
-                action: KeyAction::MouseScroll(ScrollDirection::Up, 1),
+                action: KeyAction::MouseScroll(dir, 1),
                 delay_ms: 0,
             };
-            state.selected_step = insert_step_after_selection(state, idx, step);
-            state.set_status("Inserted Scroll Up");
-        }
-        KeyCode::Char('x') | KeyCode::Char('X') => {
-            let step = MacroStep {
-                action: KeyAction::MouseScroll(ScrollDirection::Down, 1),
-                delay_ms: 0,
-            };
-            state.selected_step = insert_step_after_selection(state, idx, step);
-            state.set_status("Inserted Scroll Down");
+            match insert_step_after_selection(state, idx, step) {
+                Some(pos) => {
+                    state.selected_step = pos;
+                    state.set_status(if up { "Inserted Scroll Up" } else { "Inserted Scroll Down" });
+                }
+                None => state.set_status(step_limit_status()),
+            }
         }
         KeyCode::Char('m') | KeyCode::Char('M') => {
             let (cx, cy) = input::get_cursor_pos().unwrap_or((0, 0));
@@ -1492,8 +1530,13 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                 action: KeyAction::MouseMove(cx, cy),
                 delay_ms: 0,
             };
-            state.selected_step = insert_step_after_selection(state, idx, step);
-            state.set_status(format!("Inserted Move ({},{})", cx, cy));
+            match insert_step_after_selection(state, idx, step) {
+                Some(pos) => {
+                    state.selected_step = pos;
+                    state.set_status(format!("Inserted Move ({},{})", cx, cy));
+                }
+                None => state.set_status(step_limit_status()),
+            }
         }
         KeyCode::Char('f') | KeyCode::Char('F') => {
             if let Some(fg) = state.foreground_process.clone() {
@@ -1501,8 +1544,13 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                     action: KeyAction::WaitForWindow(fg.clone()),
                     delay_ms: 0,
                 };
-                state.selected_step = insert_step_after_selection(state, idx, step);
-                state.set_status(format!("Inserted Wait for '{}'", fg));
+                match insert_step_after_selection(state, idx, step) {
+                    Some(pos) => {
+                        state.selected_step = pos;
+                        state.set_status(format!("Inserted Wait for '{}'", fg));
+                    }
+                    None => state.set_status(step_limit_status()),
+                }
             } else {
                 state.set_status("No foreground process detected");
             }
@@ -1522,6 +1570,12 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
                 let (start, end) = state.step_selection_range(step_count);
                 let duped = state.macros[idx].steps[start..=end].to_vec();
                 let count = duped.len();
+                // Check the whole batch up front: a per-iteration check would
+                // insert a partial copy and call it a success.
+                if !steps_fit(state, idx, count) {
+                    state.set_status(step_limit_status());
+                    return;
+                }
                 for (i, step) in duped.into_iter().enumerate() {
                     state.macros[idx].steps.insert(end + 1 + i, step);
                 }
@@ -1539,14 +1593,21 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
         KeyCode::Char('p') | KeyCode::Char('P') => {
             if !state.clipboard_steps.is_empty() {
                 let count = state.clipboard_steps.len();
-                let mut steps = state.clipboard_steps.clone().into_iter();
-                let pos = insert_step_after_selection(state, idx, steps.next().expect("non-empty"));
-                for (i, step) in steps.enumerate() {
-                    state.macros[idx].steps.insert(pos + 1 + i, step);
+                // Same reason as duplicate: the batch fits or none of it does.
+                if !steps_fit(state, idx, count) {
+                    state.set_status(step_limit_status());
+                    return;
                 }
-                state.selected_step = pos;
-                state.selection_anchor = None;
-                state.set_status(format!("Pasted {} step(s)", count));
+                let mut steps = state.clipboard_steps.clone().into_iter();
+                let first = steps.next().expect("non-empty");
+                if let Some(pos) = insert_step_after_selection(state, idx, first) {
+                    for (i, step) in steps.enumerate() {
+                        state.macros[idx].steps.insert(pos + 1 + i, step);
+                    }
+                    state.selected_step = pos;
+                    state.selection_anchor = None;
+                    state.set_status(format!("Pasted {} step(s)", count));
+                }
             } else {
                 state.set_status("Nothing to paste — copy first with y");
             }
@@ -1732,8 +1793,10 @@ mod tests {
         let mut s = AppState::new();
         let mut mac = Macro::new("m".into());
         for i in 0..step_count {
+            // Wraps deliberately: step counts can exceed u16 and the tests
+            // here care about how many steps exist, not which key each is.
             mac.steps.push(MacroStep {
-                action: KeyAction::KeyDown(i as u16 + 1),
+                action: KeyAction::KeyDown((i as u16).wrapping_add(1)),
                 delay_ms: 10,
             });
         }
@@ -1744,6 +1807,65 @@ mod tests {
 
     fn press(state: &mut AppState, key: KeyCode) {
         handle_key_step_editor(state, key, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn insert_is_refused_at_the_step_limit() {
+        let mut s = step_editor_state(macro_def::MAX_STEPS);
+        press(&mut s, KeyCode::Char('w'));
+        assert_eq!(
+            s.macros[0].steps.len(),
+            macro_def::MAX_STEPS,
+            "accepting this would write a file whose tail vanishes on load"
+        );
+    }
+
+    #[test]
+    fn duplicate_is_all_or_nothing_at_the_limit() {
+        // Two steps short of the cap, duplicating four must not insert two.
+        let mut s = step_editor_state(macro_def::MAX_STEPS - 2);
+        s.selected_step = 0;
+        s.selection_anchor = Some(3);
+        let before = s.macros[0].steps.len();
+        press(&mut s, KeyCode::Char('c'));
+        assert_eq!(s.macros[0].steps.len(), before, "no partial duplicate");
+    }
+
+    #[test]
+    fn paste_is_all_or_nothing_at_the_limit() {
+        let mut s = step_editor_state(macro_def::MAX_STEPS - 2);
+        s.clipboard_steps = vec![
+            MacroStep { action: KeyAction::KeyDown(1), delay_ms: 0 };
+            4
+        ];
+        let before = s.macros[0].steps.len();
+        press(&mut s, KeyCode::Char('p'));
+        assert_eq!(s.macros[0].steps.len(), before, "no partial paste");
+    }
+
+    #[test]
+    fn insert_below_the_limit_still_works() {
+        let mut s = step_editor_state(3);
+        press(&mut s, KeyCode::Char('w'));
+        assert_eq!(s.macros[0].steps.len(), 4);
+    }
+
+    #[test]
+    fn inserted_text_is_truncated_before_it_reaches_the_step() {
+        let mut s = step_editor_state(1);
+        s.inserting_text = true;
+        let oversized = "a".repeat(macro_def::MAX_TYPE_TEXT_LEN + 500);
+        s.insert_text_buf = oversized;
+        press(&mut s, KeyCode::Enter);
+        let stored = s.macros[0].steps.iter().find_map(|st| match &st.action {
+            KeyAction::TypeText(t) => Some(t.len()),
+            _ => None,
+        });
+        assert_eq!(
+            stored,
+            Some(macro_def::MAX_TYPE_TEXT_LEN),
+            "the load clamp would otherwise trim it at next launch"
+        );
     }
 
     fn main_harness() -> (
