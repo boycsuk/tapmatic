@@ -76,8 +76,18 @@ impl ConfigField {
     /// Apply edited text to this field on `mac`.
     ///
     /// Unparseable input leaves the field unchanged (revert-on-invalid); an
-    /// emptied optional field clears it.
+    /// emptied optional field clears it. The written value is clamped before
+    /// returning: the editor is an input boundary just like the config file,
+    /// and clamping only on save leaves out-of-range values live for the rest
+    /// of the session — a `mouse_jitter` past `i32::MAX` reaches the executor's
+    /// arithmetic, and every other field silently loses its excess at the next
+    /// launch instead of at the point of entry.
     pub fn write(self, mac: &mut Macro, input: &str) {
+        self.write_unclamped(mac, input);
+        mac.clamp_to_valid_ranges();
+    }
+
+    fn write_unclamped(self, mac: &mut Macro, input: &str) {
         match self {
             Self::Name if !input.is_empty() => mac.name = input.to_string(),
             Self::FixedInterval => {
@@ -931,6 +941,46 @@ mod tests {
         assert!(ConfigField::CycleDelay.is_numeric_field());
         assert!(!ConfigField::Name.is_numeric_field());
         assert!(!ConfigField::Hotkey.is_numeric_field());
+    }
+
+    /// The editor is an input boundary: a value entered here is used by the
+    /// executor immediately, long before the save path would clamp it.
+    #[test]
+    fn editor_clamps_out_of_range_values_at_the_point_of_entry() {
+        use crate::macro_def::MAX_DELAY_MS;
+
+        let mut mac = Macro::new("m".into());
+
+        // Past i32::MAX this reached the executor's `2*jitter + 1` term.
+        ConfigField::MouseJitter.write(&mut mac, "4000000000");
+        assert!(
+            mac.mouse_jitter <= 1000,
+            "mouse_jitter {} left unclamped",
+            mac.mouse_jitter
+        );
+
+        ConfigField::HumanizeMs.write(&mut mac, &u64::MAX.to_string());
+        assert_eq!(mac.humanize_ms, MAX_DELAY_MS);
+
+        ConfigField::CycleDelay.write(&mut mac, &u64::MAX.to_string());
+        assert_eq!(mac.cycle_delay_ms, MAX_DELAY_MS);
+
+        ConfigField::StartDelay.write(&mut mac, &u64::MAX.to_string());
+        assert_eq!(mac.start_delay_ms, MAX_DELAY_MS);
+    }
+
+    /// Clamping must not disturb a value that was already in range.
+    #[test]
+    fn editor_leaves_in_range_values_untouched() {
+        let mut mac = Macro::new("m".into());
+
+        ConfigField::MouseJitter.write(&mut mac, "7");
+        ConfigField::HumanizeMs.write(&mut mac, "25");
+        ConfigField::CycleDelay.write(&mut mac, "500");
+
+        assert_eq!(mac.mouse_jitter, 7);
+        assert_eq!(mac.humanize_ms, 25);
+        assert_eq!(mac.cycle_delay_ms, 500);
     }
 
     #[test]

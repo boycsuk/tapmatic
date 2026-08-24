@@ -642,6 +642,24 @@ pub fn execute_action(action: &KeyAction, stop: &std::sync::atomic::AtomicBool) 
     }
 }
 
+/// Draw a uniform offset in `-jitter..=jitter` from the RNG state.
+///
+/// The modulo runs on the unsigned value: `%` keeps the sign of its dividend,
+/// so casting to i32 first makes half the draws negative and yields
+/// `-2*jitter..=jitter` — three times the configured spread, biased to one
+/// side and double-weighted at `-jitter`.
+///
+/// The whole computation stays in 64-bit and saturates on the way out. A
+/// `jitter` past `MAX_MOUSE_JITTER_PX` reaches here whenever an editor value
+/// has not round-tripped through the load clamp yet, and both `2*jitter + 1`
+/// and the final subtraction would otherwise overflow — a panic in debug, a
+/// silent wrap in release.
+fn jitter_offset(jitter: u32, rng: &mut u64) -> i32 {
+    let span = u64::from(jitter) * 2 + 1;
+    let draw = (xorshift64(rng) % span) as i64;
+    (draw - i64::from(jitter)).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
 /// Execute an action, offsetting a MouseMove target by up to ±`jitter` px;
 /// any other action passes through to `execute_action` unchanged.
 pub fn execute_action_with_jitter(
@@ -652,10 +670,11 @@ pub fn execute_action_with_jitter(
 ) -> bool {
     if jitter > 0
         && let KeyAction::MouseMove(x, y) = action {
-            let jitter_i = jitter as i32;
-            let dx = (xorshift64(rng) as i32 % (jitter_i * 2 + 1)) - jitter_i;
-            let dy = (xorshift64(rng) as i32 % (jitter_i * 2 + 1)) - jitter_i;
-            return send_mouse_move(x + dx, y + dy);
+            let dx = jitter_offset(jitter, rng);
+            let dy = jitter_offset(jitter, rng);
+            // Saturate: a coordinate near i32::MAX plus an offset would wrap
+            // and land the cursor on the opposite edge of the desktop.
+            return send_mouse_move(x.saturating_add(dx), y.saturating_add(dy));
         }
     execute_action(action, stop)
 }
@@ -853,6 +872,80 @@ mod tests {
         let (num8, num8_ext) = split_scancode(0x48);
         assert_eq!(up, num8);
         assert!(up_ext && !num8_ext);
+    }
+
+    /// The offset must cover `-jitter..=jitter` and nothing outside it.
+    ///
+    /// The original expression cast to i32 before the modulo, so half the
+    /// draws were negative and the range came out `-2*jitter..=jitter`.
+    #[test]
+    fn jitter_offset_stays_within_the_configured_spread() {
+        let mut rng: u64 = 0x2545F4914F6CDD1D;
+        for _ in 0..100_000 {
+            for jitter in [1u32, 5, 50, 1000] {
+                let d = jitter_offset(jitter, &mut rng);
+                assert!(
+                    d >= -(jitter as i32) && d <= jitter as i32,
+                    "offset {d} outside -{jitter}..={jitter}"
+                );
+            }
+        }
+    }
+
+    /// Every value in the range must be reachable, and the two halves must
+    /// carry comparable weight. The pre-fix version double-weighted exactly
+    /// `-jitter` and never produced anything above it on the positive side.
+    #[test]
+    fn jitter_offset_is_symmetric_and_covers_the_whole_range() {
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+        let jitter = 5u32;
+        let mut counts = [0u32; 11];
+        let draws = 220_000;
+        for _ in 0..draws {
+            let d = jitter_offset(jitter, &mut rng);
+            counts[(d + jitter as i32) as usize] += 1;
+        }
+
+        let expected = draws / 11;
+        for (i, &c) in counts.iter().enumerate() {
+            let offset = i as i32 - jitter as i32;
+            assert!(c > 0, "offset {offset} never drawn");
+            // Generous bound: this catches a 2x bias, not RNG noise.
+            assert!(
+                c > expected / 2 && c < expected * 2,
+                "offset {offset} drawn {c} times, expected around {expected}"
+            );
+        }
+
+        let negative: u32 = counts[..jitter as usize].iter().sum();
+        let positive: u32 = counts[jitter as usize + 1..].iter().sum();
+        let ratio = negative as f64 / positive as f64;
+        assert!(
+            (0.8..1.25).contains(&ratio),
+            "negative/positive draw ratio {ratio:.3} is lopsided"
+        );
+    }
+
+    /// A jitter past `MAX_MOUSE_JITTER_PX` reaches here whenever the editor
+    /// value has not round-tripped through the load clamp yet. The `2*j + 1`
+    /// term must not overflow i32: that is a panic in debug and a silent wrap
+    /// in release.
+    #[test]
+    fn jitter_offset_does_not_overflow_on_an_unclamped_value() {
+        let mut rng: u64 = 12345;
+        for jitter in [u32::MAX, u32::MAX / 2, i32::MAX as u32, 2_000_000_000] {
+            // Reaching here at all is the assertion: the pre-fix expression
+            // panicked on the multiply. The result is only bounded by the
+            // saturation, since the true range exceeds i32.
+            let d = jitter_offset(jitter, &mut rng);
+            assert!(d <= jitter.min(i32::MAX as u32) as i32);
+        }
+    }
+
+    #[test]
+    fn jitter_offset_of_zero_span_is_zero() {
+        let mut rng: u64 = 777;
+        assert_eq!(jitter_offset(0, &mut rng), 0);
     }
 
     #[test]
