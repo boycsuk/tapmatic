@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::input;
 use crate::macro_def::{KeyAction, MouseButton, RepetitionMode};
 use crate::state::AppEvent;
-use crate::{AWAITING_HOTKEY, MOUSE_MOVE_THRESHOLD, QUICK_RECORD, RECORDING, RECORD_MOUSE_MOVES, RUNNING};
+use crate::{AWAITING_HOTKEY, CAPTURE_MOUSE_BUTTONS, MOUSE_MOVE_THRESHOLD, QUICK_RECORD, RECORDING, RECORD_MOUSE_MOVES, RUNNING};
 
 /// Bound hotkeys shared between the UI thread (writer) and the scan loop.
 pub struct HotkeyConfig {
@@ -125,11 +125,22 @@ fn snapshot_all_keys(prev_state: &mut [bool; 256]) {
     }
 }
 
+/// Whether `vk` must be ignored during a "press a key" capture.
+///
+/// Clicking the UI while binding a hotkey must not bind the macro to a mouse
+/// button, which would then fire on every click anywhere. Step captures DO
+/// accept LMB/RMB/MMB; the X side buttons never pass (unbindable for the same
+/// reason, and they have no step mapping).
+fn capture_excluded(vk: i32, capture_mouse: bool) -> bool {
+    vk == VK_ESCAPE
+        || (!capture_mouse && matches!(vk, 0x01 | 0x02 | 0x04))
+        || matches!(vk, 0x05 | 0x06)
+}
+
 fn capture_scan(tx: &mpsc::Sender<AppEvent>, prev_state: &mut [bool; 256]) {
+    let capture_mouse = CAPTURE_MOUSE_BUTTONS.load(Ordering::SeqCst);
     for vk in 0x01i32..=0xFE {
-        // Clicking the UI during "press a key" must not bind the macro to a
-        // mouse button, which would then fire on every click anywhere.
-        if vk == VK_ESCAPE || matches!(vk, 0x01 | 0x02 | 0x04) {
+        if capture_excluded(vk, capture_mouse) {
             continue;
         }
         if key_edge(vk, prev_state) == Edge::Released {
@@ -261,6 +272,24 @@ fn normal_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_exclusion_gates_mouse_buttons_by_mode() {
+        // Hotkey binding: no mouse button may bind.
+        for vk in [0x01, 0x02, 0x04, 0x05, 0x06] {
+            assert!(capture_excluded(vk, false), "vk {vk:#x} must not bind a hotkey");
+        }
+        // Step capture: the three real buttons pass, the X buttons never do.
+        for vk in [0x01, 0x02, 0x04] {
+            assert!(!capture_excluded(vk, true), "vk {vk:#x} must reach step capture");
+        }
+        for vk in [0x05, 0x06] {
+            assert!(capture_excluded(vk, true));
+        }
+        // Escape always cancels instead of binding; keys always pass.
+        assert!(capture_excluded(VK_ESCAPE, true));
+        assert!(!capture_excluded(0x41, false));
+    }
 
     #[test]
     fn edge_table() {

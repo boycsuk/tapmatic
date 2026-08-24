@@ -292,7 +292,9 @@ fn draw_main(f: &mut Frame, state: &AppState) {
                 let process: String = match (&mac.bound_process, mac.send_mode) {
                     (Some(p), SendMode::Window) => format!("{} [W]", p),
                     (Some(p), SendMode::Global) => p.clone(),
-                    (None, _) => "Any".into(),
+                    // Window mode without a process runs as Global; say so.
+                    (None, SendMode::Window) => "Any [W?]".into(),
+                    (None, SendMode::Global) => "Any".into(),
                 };
 
                 let status_text: String;
@@ -544,7 +546,7 @@ fn draw_recording(f: &mut Frame, state: &AppState) {
 fn config_field_hint(field: ConfigField) -> &'static str {
     match field {
         ConfigField::Name => "Display name for this macro",
-        ConfigField::Hotkey => "Enter to bind any key or mouse button | Esc to cancel",
+        ConfigField::Hotkey => "Enter to bind any key | Esc to cancel",
         ConfigField::RepetitionMode => "Left/Right to cycle: Toggle | Hold | Single",
         ConfigField::DelayMode => "Left/Right to cycle: Recorded | Fixed",
         ConfigField::FixedInterval => "Milliseconds between each step when using Fixed mode",
@@ -557,7 +559,7 @@ fn config_field_hint(field: ConfigField) -> &'static str {
         ConfigField::RequireHeld => "Enter to capture key | Macro pauses when this key is released",
         ConfigField::ExclusiveGroup => "Group name | Activating one stops others in same group",
         ConfigField::ChainMacro => "Enter to select macro to auto-start when this one finishes",
-        ConfigField::SendMode => "Global = needs focus (games) | Window = no focus needed (apps)",
+        ConfigField::SendMode => "Global = needs focus (games) | Window = no focus, requires a bound process",
         ConfigField::BoundProcess => "Enter to browse processes | or type process name",
         ConfigField::MouseJitter => "Random pixel offset for MouseMove steps (0 = exact)",
         ConfigField::HumanizeMs => "Random timing jitter per step (±ms). Makes timing less robotic",
@@ -1054,7 +1056,7 @@ fn build_help_content() -> Vec<Line<'static>> {
         blank(),
         h("CONFIG FIELDS"),
         s("Name", "Display name for the macro"),
-        s("Hotkey", "Key/mouse button to activate (Enter to capture)"),
+        s("Hotkey", "Key to activate (Enter to capture)"),
         s("Repeat mode", "Toggle (on/off) | Hold (while pressed) | Single (once)"),
         s("Stop condition", "None | After N reps | After N seconds"),
         s("Delay mode", "Recorded (original timing) | Fixed (constant)"),
@@ -1064,7 +1066,7 @@ fn build_help_content() -> Vec<Line<'static>> {
         s("Require held", "Only execute while this key is held"),
         s("Exclusive grp", "Activating one stops others in same group"),
         s("Chain macro", "Auto-start another macro when this finishes"),
-        s("Send mode", "Global (needs focus) | Window (PostMessage, no focus)"),
+        s("Send mode", "Global (needs focus) | Window (PostMessage, no focus; needs a bound process)"),
         s("Bound process", "Only run for specific process window"),
         s("Mouse jitter", "Random pixel offset for mouse moves (anti-detection)"),
         s("Humanize", "Random timing jitter per step (makes timing less robotic)"),

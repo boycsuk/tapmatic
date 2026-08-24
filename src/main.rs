@@ -24,6 +24,7 @@ pub static RECORDING: AtomicBool = AtomicBool::new(false);
 pub static AUDIO_ENABLED: AtomicBool = AtomicBool::new(true);
 pub static MACROS_ENABLED: AtomicBool = AtomicBool::new(true);
 pub static AWAITING_HOTKEY: AtomicBool = AtomicBool::new(false);
+pub static CAPTURE_MOUSE_BUTTONS: AtomicBool = AtomicBool::new(false);
 pub static SPEED_MULTIPLIER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x3FF0000000000000); // 1.0f64 as bits
 pub static QUICK_RECORD: AtomicBool = AtomicBool::new(false);
 pub static RECORD_MOUSE_MOVES: AtomicBool = AtomicBool::new(false);
@@ -517,10 +518,49 @@ fn capture_config_binding(state: &mut AppState, vk: i32) {
         mac.require_held_vk = vk;
         format!("Require held: [{}]", vk_name(vk))
     };
+    end_key_capture(state);
+    state.set_status(label);
+}
+
+/// What a "press a key" capture is for; step captures also accept mouse
+/// buttons, hotkey bindings must not (a click on the UI would bind the macro
+/// to that button and fire it on every click anywhere).
+#[derive(Clone, Copy, PartialEq)]
+enum KeyCapture {
+    HotkeyBinding,
+    RequireHeldBinding,
+    StepReplace,
+    StepInsert,
+}
+
+/// Enter key-capture mode, keeping the AppState flags and the atomics the
+/// hotkey thread reads in lockstep — one missed store here silently eats all
+/// keyboard input.
+fn begin_key_capture(state: &mut AppState, mode: KeyCapture) {
+    match mode {
+        KeyCapture::HotkeyBinding => state.awaiting_hotkey = true,
+        KeyCapture::RequireHeldBinding => state.awaiting_require_held = true,
+        KeyCapture::StepReplace => state.editing_step_action = true,
+        KeyCapture::StepInsert => state.inserting_key_step = true,
+    }
+    AWAITING_HOTKEY.store(true, Ordering::SeqCst);
+    CAPTURE_MOUSE_BUTTONS.store(capture_accepts_mouse(mode), Ordering::SeqCst);
+}
+
+/// Step captures accept mouse buttons; bindings are keyboard-only.
+fn capture_accepts_mouse(mode: KeyCapture) -> bool {
+    matches!(mode, KeyCapture::StepReplace | KeyCapture::StepInsert)
+}
+
+/// Leave key-capture mode. Only one capture is ever active, so clearing all
+/// four flags is safe from any exit path.
+fn end_key_capture(state: &mut AppState) {
     state.awaiting_hotkey = false;
     state.awaiting_require_held = false;
+    state.editing_step_action = false;
+    state.inserting_key_step = false;
     AWAITING_HOTKEY.store(false, Ordering::SeqCst);
-    state.set_status(label);
+    CAPTURE_MOUSE_BUTTONS.store(false, Ordering::SeqCst);
 }
 
 /// Replace the selected step's action with a captured key, keeping direction.
@@ -539,8 +579,7 @@ fn capture_step_replacement(state: &mut AppState, vk: i32) {
             state.set_status(format!("Action changed to {}", name));
         }
     }
-    state.editing_step_action = false;
-    AWAITING_HOTKEY.store(false, Ordering::SeqCst);
+    end_key_capture(state);
 }
 
 /// Insert a captured key as a down+up step pair after the selection.
@@ -562,8 +601,7 @@ fn capture_key_pair_insert(state: &mut AppState, vk: i32) {
         state.selected_step = pos;
         state.set_status(format!("Inserted {} (down+up)", name));
     }
-    state.inserting_key_step = false;
-    AWAITING_HOTKEY.store(false, Ordering::SeqCst);
+    end_key_capture(state);
 }
 
 fn handle_key(
@@ -990,13 +1028,12 @@ fn handle_key_config(
     };
 
     // While awaiting hotkey, only Esc cancels — everything else is captured
-    // by the hotkey thread (all keys + mouse buttons via GetAsyncKeyState).
+    // by the hotkey thread (keyboard only: capture_scan drops mouse buttons
+    // for bindings).
     // Crossterm might also fire, so just ignore everything except Esc here.
     if state.awaiting_hotkey || state.awaiting_require_held {
         if key == KeyCode::Esc {
-            state.awaiting_hotkey = false;
-            state.awaiting_require_held = false;
-            AWAITING_HOTKEY.store(false, Ordering::SeqCst);
+            end_key_capture(state);
             state.set_status("Binding cancelled");
         }
         return;
@@ -1065,6 +1102,15 @@ fn handle_key_config(
                         SendMode::Global => SendMode::Window,
                         SendMode::Window => SendMode::Global,
                     };
+                    // Without a bound process, Window mode silently degrades
+                    // to global SendInput (executor::HeldInputs::new).
+                    if state.macros[idx].send_mode == SendMode::Window
+                        && state.macros[idx].bound_process.is_none()
+                    {
+                        state.set_status_persistent(
+                            "Window mode needs a bound process — set one or input stays global",
+                        );
+                    }
                 }
                 _ => {
                     // Text/numeric fields: cursor movement (including Ctrl+Arrow word jump)
@@ -1084,13 +1130,11 @@ fn handle_key_config(
             apply_config_field(state, idx);
             match state.config_field {
                 ConfigField::Hotkey => {
-                    state.awaiting_hotkey = true;
-                    AWAITING_HOTKEY.store(true, Ordering::SeqCst);
-                    state.set_status_persistent("Press any key or mouse button...");
+                    begin_key_capture(state, KeyCapture::HotkeyBinding);
+                    state.set_status_persistent("Press any key...");
                 }
                 ConfigField::RequireHeld => {
-                    state.awaiting_require_held = true;
-                    AWAITING_HOTKEY.store(true, Ordering::SeqCst);
+                    begin_key_capture(state, KeyCapture::RequireHeldBinding);
                     state.set_status_persistent("Press the key that must be held...");
                 }
                 ConfigField::ChainMacro => {
@@ -1258,9 +1302,7 @@ fn handle_step_editor_modal(
     if state.inserting_key_step || state.editing_step_action {
         if key == KeyCode::Esc {
             let msg = if state.inserting_key_step { "Insert key cancelled" } else { "Action edit cancelled" };
-            state.inserting_key_step = false;
-            state.editing_step_action = false;
-            AWAITING_HOTKEY.store(false, Ordering::SeqCst);
+            end_key_capture(state);
             state.set_status(msg);
         }
         return true;
@@ -1394,8 +1436,7 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
         KeyCode::Char('a') | KeyCode::Char('A')
             // Replace key/button (keeps Down/Up direction)
             if step_count > 0 => {
-                state.editing_step_action = true;
-                AWAITING_HOTKEY.store(true, Ordering::SeqCst);
+                begin_key_capture(state, KeyCapture::StepReplace);
                 state.set_status_persistent("Press a key or mouse button to replace action...");
             }
         KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -1457,8 +1498,7 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             state.set_status_persistent("Type text and press Enter to insert...");
         }
         KeyCode::Char('n') | KeyCode::Char('N') => {
-            state.inserting_key_step = true;
-            AWAITING_HOTKEY.store(true, Ordering::SeqCst);
+            begin_key_capture(state, KeyCapture::StepInsert);
             state.set_status_persistent("Press a key to insert (down+up pair)...");
         }
         KeyCode::Char('c') | KeyCode::Char('C')
@@ -1757,6 +1797,42 @@ mod tests {
         assert_eq!(s.macros[0].name, "alpha");
         assert_eq!(s.undo_stack.len(), 1, "manual order must be undoable");
         assert!(s.unsaved_changes, "the sorted order must persist");
+    }
+
+    #[test]
+    fn key_capture_modes_map_to_the_right_flags() {
+        // The atomics are process-global and other tests store them in
+        // parallel; assert the per-state flags and the pure mode mapping.
+        let mut s = named_macros(&["m"]);
+
+        begin_key_capture(&mut s, KeyCapture::StepInsert);
+        assert!(s.inserting_key_step);
+        end_key_capture(&mut s);
+        assert!(!s.inserting_key_step);
+
+        begin_key_capture(&mut s, KeyCapture::HotkeyBinding);
+        assert!(s.awaiting_hotkey);
+        end_key_capture(&mut s);
+        assert!(!s.awaiting_hotkey);
+
+        assert!(capture_accepts_mouse(KeyCapture::StepInsert));
+        assert!(capture_accepts_mouse(KeyCapture::StepReplace));
+        assert!(!capture_accepts_mouse(KeyCapture::HotkeyBinding));
+        assert!(!capture_accepts_mouse(KeyCapture::RequireHeldBinding));
+    }
+
+    #[test]
+    fn captured_mouse_button_inserts_a_click_step_pair() {
+        let mut s = named_macros(&["m"]);
+        s.view = View::StepEditor(0);
+        s.selected_step = 0;
+        s.inserting_key_step = true;
+
+        capture_key_pair_insert(&mut s, 0x01);
+
+        let steps = &s.macros[0].steps;
+        assert!(matches!(steps[1].action, KeyAction::MouseDown(macro_def::MouseButton::Left)));
+        assert!(matches!(steps[2].action, KeyAction::MouseUp(macro_def::MouseButton::Left)));
     }
 
     #[test]
