@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-24
+
+### Fixed
+
+- Mouse macros now replay correctly on multi-monitor setups. Coordinates are
+  recorded in virtual-desktop space, where a monitor left of the primary gives
+  negative values, but replay normalized them against the primary monitor's
+  size alone, so every click outside it was clamped to the primary's edge and
+  landed in the wrong window. Replay now normalizes against the virtual
+  desktop's own origin and extent and passes `MOUSEEVENTF_VIRTUALDESK`.
+- Arrow keys, the navigation cluster, right Ctrl/Alt and numpad Enter replay as
+  themselves instead of their numpad twins. Recording mapped virtual keys with
+  `MAPVK_VK_TO_VSC`, which drops the `0xE0` extended prefix, so Up and numpad-8
+  both became scancode `0x48` and a recorded arrow typed an `8`. The prefix is
+  now kept in the stored scancode and turned back into `KEYEVENTF_EXTENDEDKEY`
+  on replay, in both global and window send modes. Macros recorded before this
+  release stored those keys without the prefix and are indistinguishable from
+  their numpad twins, so an affected step keeps replaying as the numpad key
+  until it is re-recorded; hotkeys are unaffected, as they store virtual-key
+  codes and are remapped at startup.
+- Text inserted in the step editor is truncated before the step is built. The
+  truncation was applied to a copy used only for the status message, so an
+  oversized paste was written to disk in full and then trimmed by the load-time
+  clamp, losing the tail between sessions.
+- The step editor refuses inserts past `MAX_STEPS` instead of accepting steps
+  that the next launch would silently discard. Duplicate and paste check the
+  whole batch up front, so they either fit entirely or change nothing.
+- The config file is now flushed to disk before the rename that publishes it,
+  and the rename itself is flushed afterwards. Without this a power loss could
+  leave a zero-length config, and on a full disk the write appeared to succeed
+  while a truncated temp file was renamed over the good config.
+- Macros are clamped to their valid ranges on save as well as on load, so what
+  is written always matches what will be read back.
+- A macro thread that panics now reports itself as finished. Previously the
+  event was skipped, leaving the macro shown as ACTIVE and unstoppable, since
+  the executor had already dropped its entry.
+- `StopCondition::AfterSecs` is honoured during waits and between steps, not
+  only between repetitions. A macro parked in `WaitForWindow`, or running one
+  long repetition, could overrun its configured limit indefinitely.
+- Speed scaling no longer floors a real delay to zero: at 4x every delay under
+  4 ms collapsed into a busy send.
+- Restarting a recording no longer strands the previous scroll hook. `start` is
+  idempotent, and the hook thread publishes its id only after the hook is
+  installed and only on success, so a `stop` racing it cannot clear an id a
+  newer thread already claimed. Each orphaned `WH_MOUSE_LL` taxed every mouse
+  event system-wide.
+- Default macro names skip names already in use. Counting the list reused a
+  number after a deletion, and since chains resolve their target by name, a
+  chain could silently follow the wrong macro.
+- Window titles are cut with the length `GetWindowTextW` actually wrote rather
+  than the earlier `GetWindowTextLengthW` value, so a title that changes
+  between the two calls no longer leaves padding zeros in the string.
+
+### Added
+
+- A DPI manifest declaring `PerMonitorV2` awareness. Without it the process was
+  DPI-virtualized and cursor coordinates were reported scaled, so macros
+  recorded on a scaled display replayed offset elsewhere.
+
+### Changed
+
+- Interruptible sleeps wake every 25 ms instead of every 5 ms, cutting an
+  hour-long delay from 720k wakeups to 144k without a perceptible change in
+  stop latency.
+- The panic hook installed in `main` was removed; `ratatui::init()` already
+  installs one. The second hook could restore the terminal from a macro
+  thread's panic while the TUI was still drawing into it.
+
 ## [0.2.1] - 2026-08-24
 
 ### Added
