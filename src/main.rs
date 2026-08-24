@@ -95,12 +95,9 @@ const MAX_SPEED_MULTIPLIER: f64 = 4.0;
 const SPEED_MULTIPLIER_STEP: f64 = 0.25;
 
 fn main() {
-    // Panic handler: restore terminal before printing panic info
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        ratatui::restore();
-        default_hook(info);
-    }));
+    // No panic hook here: `ratatui::init()` installs one that restores the
+    // terminal, and a second one firing on a macro thread's panic would tear
+    // down the alternate screen while the TUI is still drawing into it.
 
     input::begin_high_res_timer();
 

@@ -49,8 +49,12 @@ pub fn executor_loop(rx: mpsc::Receiver<ExecutorCommand>, feedback_tx: mpsc::Sen
                     let spawned = thread::Builder::new()
                         .name(format!("macro-{}", vk))
                         .spawn(move || {
+                            // Sent from Drop, not inline: a panic in
+                            // execute_macro would otherwise skip it and leave
+                            // the UI showing a macro that can never be stopped.
+                            let mut finished = FinishedOnDrop { tx: &fb_tx, vk, sent: false };
                             let completed = execute_macro(&mac, &flag_clone, &fb_tx);
-                            let _ = fb_tx.send(AppEvent::MacroFinished(vk));
+                            finished.finish_now();
                             // Chaining an aborted macro would let a
                             // self-chaining one restart forever with no way
                             // to stop it.
@@ -149,6 +153,35 @@ fn wait_until(stop_flag: &AtomicBool, poll_ms: u64, cond: impl Fn() -> bool) -> 
         thread::sleep(Duration::from_millis(poll_ms));
     }
     should_stop(stop_flag)
+}
+
+/// Report a macro thread as finished exactly once, on unwind as well as on a
+/// normal return. Without this a panicking macro stays ACTIVE in the UI and
+/// `stop_macro` becomes a no-op, since the executor already dropped its entry.
+struct FinishedOnDrop<'a> {
+    tx: &'a mpsc::Sender<AppEvent>,
+    vk: i32,
+    sent: bool,
+}
+
+impl FinishedOnDrop<'_> {
+    /// Send now rather than at scope end.
+    ///
+    /// The chain handler skips a target that is still active, so a
+    /// self-chaining macro needs this event to land *before* `ChainMacro` or
+    /// the chain is silently dropped.
+    fn finish_now(&mut self) {
+        if !self.sent {
+            self.sent = true;
+            let _ = self.tx.send(AppEvent::MacroFinished(self.vk));
+        }
+    }
+}
+
+impl Drop for FinishedOnDrop<'_> {
+    fn drop(&mut self) {
+        self.finish_now();
+    }
 }
 
 /// Keys and buttons pressed during execution, released on `Drop` so they are
@@ -459,6 +492,31 @@ mod tests {
     fn humanize_extreme_value_does_not_overflow() {
         let d = apply_humanize(50, u64::MAX, 12345);
         assert!(d >= 1);
+    }
+
+    #[test]
+    fn finished_is_reported_even_when_the_thread_unwinds() {
+        // The UI drops a macro from active_macros on MacroFinished; losing it
+        // to a panic leaves the macro ACTIVE with no way to stop it.
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let _finished = FinishedOnDrop { tx: &tx, vk: 0x42, sent: false };
+            panic!("macro thread blew up");
+        });
+        assert!(handle.join().is_err(), "the thread really panicked");
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::MacroFinished(0x42))));
+    }
+
+    #[test]
+    fn finished_is_sent_exactly_once() {
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut finished = FinishedOnDrop { tx: &tx, vk: 7, sent: false };
+            finished.finish_now();
+            finished.finish_now();
+        }
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::MacroFinished(7))));
+        assert!(rx.try_recv().is_err(), "Drop must not send a second time");
     }
 
     #[test]
