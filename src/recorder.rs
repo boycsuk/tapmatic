@@ -89,7 +89,10 @@ pub fn process_record_event(state: &mut AppState, action: KeyAction, instant: In
     };
 
     state.recording_last_instant = Some(instant);
-    state.recording_steps.push(MacroStep { action, delay_ms });
+    // Past this the load clamp would silently drop the tail at next launch.
+    if state.recording_steps.len() < crate::macro_def::MAX_STEPS {
+        state.recording_steps.push(MacroStep { action, delay_ms });
+    }
 }
 
 #[cfg(test)]

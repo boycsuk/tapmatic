@@ -386,7 +386,7 @@ fn strip_control_chars(s: &mut String) {
 
 /// Truncate to at most `max_bytes`, backing up to the nearest char boundary:
 /// `String::truncate` panics on a byte index inside a multibyte character.
-fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) {
+pub fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) {
     if s.len() <= max_bytes {
         return;
     }
@@ -403,11 +403,11 @@ pub fn is_valid_vk(vk: i32) -> bool {
 }
 
 const MAX_NAME_LEN: usize = 128;
-const MAX_STEPS: usize = 100_000;
-const MAX_TYPE_TEXT_LEN: usize = 10_000;
+pub const MAX_STEPS: usize = 100_000;
+pub const MAX_TYPE_TEXT_LEN: usize = 10_000;
 /// Windows MAX_PATH: process names cannot legitimately exceed it.
 const MAX_PROCESS_NAME_LEN: usize = 260;
-const MAX_SCROLL_CLICKS: u32 = 100;
+pub const MAX_SCROLL_CLICKS: u32 = 100;
 /// Generous bound for multi-monitor virtual desktops that keeps
 /// `coord + jitter` arithmetic far from i32 overflow.
 const MAX_MOUSE_COORD: i32 = 100_000;
@@ -415,7 +415,7 @@ const MAX_MOUSE_COORD: i32 = 100_000;
 pub const MAX_MACROS: usize = 1_000;
 /// One hour: long enough for any real macro, short enough to stay in u64 range
 /// once multiplied by the humanize span.
-const MAX_DELAY_MS: u64 = 60 * 60 * 1000;
+pub const MAX_DELAY_MS: u64 = 60 * 60 * 1000;
 const MAX_MOUSE_JITTER_PX: u32 = 1000;
 
 /// Convert a Windows virtual-key code to a human-readable name.

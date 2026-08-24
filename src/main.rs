@@ -251,6 +251,16 @@ fn enforce_exclusive_group(
     }
 }
 
+/// Refuse to add a macro past the persistence cap: the load clamp would
+/// silently drop the excess at next launch.
+fn can_add_macro(state: &mut AppState) -> bool {
+    if state.macros.len() >= macro_def::MAX_MACROS {
+        state.set_status(format!("Macro limit reached ({})", macro_def::MAX_MACROS));
+        return false;
+    }
+    true
+}
+
 /// Append a quick-recorded macro and return to the main view.
 fn commit_quick_recording(state: &mut AppState, mac: Macro) {
     let count = mac.steps.len();
@@ -386,8 +396,7 @@ fn handle_app_event(
                     commit_quick_recording(state, mac);
                 }
                 QUICK_RECORD.store(false, Ordering::SeqCst);
-            } else if state.view == View::Main {
-                // Start quick-recording
+            } else if state.view == View::Main && can_add_macro(state) {
                 recorder::start_recording(state);
                 QUICK_RECORD.store(true, Ordering::SeqCst);
                 state.set_status_persistent("Quick recording... Alt+Z to stop");
@@ -556,6 +565,9 @@ fn activate_button(
 ) {
     match state.selected_button {
         BTN_RECORD => {
+            if !can_add_macro(state) {
+                return;
+            }
             recorder::start_recording(state);
             update_hotkey_config(state, hotkey_config);
         }
@@ -568,6 +580,9 @@ fn activate_button(
         }
         BTN_COPY => {
             if let Some(real_idx) = resolve_selected_macro(state) {
+                if !can_add_macro(state) {
+                    return;
+                }
                 let src_name = state.macros[real_idx].name.clone();
                 let mut copy = state.macros[real_idx].clone();
                 copy.name = format!("{} (copy)", copy.name);
@@ -658,7 +673,8 @@ fn handle_key_main(
                 if let Some(real_idx) = resolve_selected_macro(state)
                     && !name.is_empty() {
                         state.macros[real_idx].name = name.clone();
-                        state.set_status(format!("Renamed to '{}'", name));
+                        state.macros[real_idx].clamp_to_valid_ranges();
+                        state.set_status(format!("Renamed to '{}'", state.macros[real_idx].name));
                         autosave(state);
                     }
                 state.renaming = false;
@@ -746,8 +762,7 @@ fn handle_key_main(
         KeyCode::Char(' ') => {
             if let Some(real_idx) = resolve_selected_macro(state) {
                 enter_config(state, real_idx);
-            } else {
-                // No macros? Start recording
+            } else if can_add_macro(state) {
                 recorder::start_recording(state);
                 update_hotkey_config(state, hotkey_config);
             }
@@ -1086,6 +1101,10 @@ fn handle_key_config(
 fn apply_config_field(state: &mut AppState, idx: usize) {
     let input = state.config_input_buf.clone();
     state.config_field.write(&mut state.macros[idx], &input);
+    // Same bounds as the load path: without this, an in-session value past a
+    // limit (jitter, delays, name length) is silently changed at next launch,
+    // and an oversized jitter overflows the i32 math in the executor.
+    state.macros[idx].clamp_to_valid_ranges();
 }
 
 fn prefill_config_buf(state: &mut AppState, idx: usize) {
@@ -1195,6 +1214,8 @@ fn handle_step_editor_modal(
                         action: KeyAction::TypeText(text.clone()),
                         delay_ms: 0,
                     };
+                    let mut text = text;
+                    macro_def::truncate_on_char_boundary(&mut text, macro_def::MAX_TYPE_TEXT_LEN);
                     let pos = insert_step_after_selection(state, idx, step);
                     state.selected_step = pos;
                     state.set_status(format!("Inserted text: \"{}\"", text));
@@ -1217,9 +1238,10 @@ fn handle_step_editor_modal(
                     && clicks > 0
                         && let Some(step) = state.macros[idx].steps.get_mut(state.selected_step)
                             && let KeyAction::MouseScroll(dir, ref mut c) = step.action {
-                                *c = clicks;
+                                let clamped = clicks.min(macro_def::MAX_SCROLL_CLICKS);
+                                *c = clamped;
                                 let label = if dir == ScrollDirection::Up { "up" } else { "down" };
-                                state.set_status(format!("Scroll {} x{}", label, clicks));
+                                state.set_status(format!("Scroll {} x{}", label, clamped));
                             }
                 state.editing_scroll_clicks = false;
             }
@@ -1234,7 +1256,7 @@ fn handle_step_editor_modal(
             ModalOutcome::Committed(buf) => {
                 if let Ok(ms) = buf.parse::<u64>()
                     && let Some(step) = state.macros[idx].steps.get_mut(state.selected_step) {
-                        step.delay_ms = ms;
+                        step.delay_ms = ms.min(macro_def::MAX_DELAY_MS);
                     }
                 state.editing_step_delay = false;
             }
@@ -1675,6 +1697,33 @@ mod tests {
         assert_eq!(s.macros[0].name, "alpha");
         assert_eq!(s.undo_stack.len(), 1, "manual order must be undoable");
         assert!(s.unsaved_changes, "the sorted order must persist");
+    }
+
+    #[test]
+    fn config_commit_applies_the_load_clamp() {
+        let mut s = named_macros(&["m"]);
+        s.config_field = state::ConfigField::MouseJitter;
+        s.config_input_buf = format!("{}", u32::MAX);
+
+        apply_config_field(&mut s, 0);
+
+        // Unclamped, this value overflows the i32 jitter math in the executor.
+        assert!(s.macros[0].mouse_jitter <= 1000);
+    }
+
+    #[test]
+    fn copy_refuses_past_the_macro_cap() {
+        let (tx, _rx, cfg) = main_harness();
+        let mut s = named_macros(&["m"]);
+        // Simulate a full macro list without allocating 1000 real entries.
+        let filler = s.macros[0].clone();
+        s.macros.resize(macro_def::MAX_MACROS, filler);
+        s.selected_macro = 0;
+        s.selected_button = BTN_COPY;
+
+        activate_button(&mut s, &tx, &cfg);
+
+        assert_eq!(s.macros.len(), macro_def::MAX_MACROS, "no macro may be added past the cap");
     }
 
     #[test]

@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The config file was read and parsed with no size limit, so a multi-gigabyte
   `.tapmatic.json` caused unbounded memory use at every startup. Files over
   64 MB are now refused before parsing and reported as corrupt.
+- In-session edits bypassed every load-time bound: a huge mouse-jitter or
+  scroll-clicks value overflowed the executor's i32 math (garbage input
+  injected system-wide in release builds), and oversized names, TypeText
+  payloads, recordings and macro counts were silently truncated at the next
+  launch. Config commits now run the same clamp as the load path, the
+  recorder stops at the step cap, and copy/record refuse to exceed the macro
+  cap. The wheel-delta math also saturates as defense in depth.
 - A macro with zero steps was startable and became an unstoppable busy loop:
   no iteration ever read the stop flag, `stop()` joined forever and quitting
   hung the app. Empty macros are now refused at start and the executor loop

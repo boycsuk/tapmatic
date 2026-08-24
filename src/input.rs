@@ -89,12 +89,11 @@ mod platform {
     }
 
     pub fn send_mouse_scroll(up: bool, clicks: u32) -> bool {
-        // Positive delta = scroll up, negative = scroll down.
-        let delta = if up {
-            crate::input::WHEEL_DELTA * clicks as i32
-        } else {
-            -(crate::input::WHEEL_DELTA * clicks as i32)
-        };
+        // Positive delta = scroll up, negative = scroll down. i64 math with a
+        // final clamp: an unclamped clicks value must saturate, not overflow.
+        let magnitude = i64::from(crate::input::WHEEL_DELTA) * i64::from(clicks);
+        let delta = if up { magnitude } else { -magnitude }
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
         send(&[mouse_input(0, 0, delta as u32, MOUSEEVENTF_WHEEL)])
     }
 
