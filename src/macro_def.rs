@@ -320,6 +320,7 @@ impl Macro {
     /// shared between users, and nothing else between `serde_json` and the
     /// executor enforces these bounds.
     pub fn clamp_to_valid_ranges(&mut self) {
+        strip_control_chars(&mut self.name);
         truncate_on_char_boundary(&mut self.name, MAX_NAME_LEN);
         self.steps.truncate(MAX_STEPS);
 
@@ -341,12 +342,15 @@ impl Macro {
         }
 
         if let Some(group) = &mut self.exclusive_group {
+            strip_control_chars(group);
             truncate_on_char_boundary(group, MAX_NAME_LEN);
         }
         if let Some(name) = &mut self.chain_macro {
+            strip_control_chars(name);
             truncate_on_char_boundary(name, MAX_NAME_LEN);
         }
         if let Some(process) = &mut self.bound_process {
+            strip_control_chars(process);
             truncate_on_char_boundary(process, MAX_PROCESS_NAME_LEN);
         }
 
@@ -355,7 +359,8 @@ impl Macro {
             match &mut step.action {
                 KeyAction::TypeText(text) => truncate_on_char_boundary(text, MAX_TYPE_TEXT_LEN),
                 KeyAction::WaitForWindow(process) => {
-                    truncate_on_char_boundary(process, MAX_PROCESS_NAME_LEN)
+                    strip_control_chars(process);
+                    truncate_on_char_boundary(process, MAX_PROCESS_NAME_LEN);
                 }
                 KeyAction::MouseScroll(_, clicks) => *clicks = (*clicks).min(MAX_SCROLL_CLICKS),
                 KeyAction::MouseMove(x, y) => {
@@ -369,6 +374,14 @@ impl Macro {
             }
         }
     }
+}
+
+/// Remove control characters: macro names reach the console title via
+/// crossterm's `SetTitle`, which emits a raw OSC sequence with no escaping,
+/// so an embedded BEL/ESC would inject arbitrary terminal escape sequences.
+/// (TypeText payloads are exempt: control characters there are typed input.)
+fn strip_control_chars(s: &mut String) {
+    s.retain(|c| !c.is_control());
 }
 
 /// Truncate to at most `max_bytes`, backing up to the nearest char boundary:
@@ -857,6 +870,33 @@ mod tests {
         assert_eq!(m.start_delay_ms, max_ms);
         assert_eq!(m.cycle_delay_ms, max_ms);
         assert_eq!(m.mouse_jitter, 1000);
+    }
+
+    #[test]
+    fn clamp_strips_control_chars_from_rendered_strings() {
+        // Names reach the console title unescaped; BEL/ESC must not survive.
+        let mut mac = Macro::new("a\u{7}b\u{1b}]52;c\u{7}".into());
+        mac.exclusive_group = Some("g\u{1b}".into());
+        mac.chain_macro = Some("c\u{7}".into());
+        mac.bound_process = Some("p\r\n".into());
+        mac.steps.push(MacroStep {
+            action: KeyAction::WaitForWindow("w\u{1b}".into()),
+            delay_ms: 0,
+        });
+        mac.steps.push(MacroStep {
+            action: KeyAction::TypeText("keep\ttabs".into()),
+            delay_ms: 0,
+        });
+
+        mac.clamp_to_valid_ranges();
+
+        assert_eq!(mac.name, "ab]52;c");
+        assert_eq!(mac.exclusive_group.as_deref(), Some("g"));
+        assert_eq!(mac.chain_macro.as_deref(), Some("c"));
+        assert_eq!(mac.bound_process.as_deref(), Some("p"));
+        assert!(matches!(&mac.steps[0].action, KeyAction::WaitForWindow(w) if w == "w"));
+        // TypeText is typed input: control characters there are data.
+        assert!(matches!(&mac.steps[1].action, KeyAction::TypeText(t) if t == "keep\ttabs"));
     }
 
     #[test]

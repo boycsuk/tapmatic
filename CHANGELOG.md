@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A macro name (or group/chain/process string) containing control characters
+  reached the console title through crossterm's `SetTitle`, which emits a raw
+  OSC sequence: a crafted shared config could inject arbitrary terminal
+  escape sequences. Control characters are now stripped at the load clamp
+  (TypeText payloads excepted - there they are typed input).
+- The config file was read and parsed with no size limit, so a multi-gigabyte
+  `.tapmatic.json` caused unbounded memory use at every startup. Files over
+  64 MB are now refused before parsing and reported as corrupt.
 - A macro with zero steps was startable and became an unstoppable busy loop:
   no iteration ever read the stop flag, `stop()` joined forever and quitting
   hung the app. Empty macros are now refused at start and the executor loop

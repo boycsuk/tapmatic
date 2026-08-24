@@ -8,6 +8,11 @@ use crate::macro_def::{Macro, MAX_MACROS};
 
 pub const FILE_NAME: &str = ".tapmatic.json";
 
+/// Refuse config files larger than this before parsing: the file is the
+/// untrusted-input boundary, and all clamping runs only after `serde_json`
+/// has fully materialized the document.
+const MAX_CONFIG_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Top-level config file: settings + macros in one file.
 #[derive(Serialize, Deserialize)]
 pub struct AppConfig {
@@ -119,7 +124,7 @@ pub fn load() -> LoadOutcome {
 }
 
 fn load_from(path: &Path, legacy: Option<&Path>) -> LoadOutcome {
-    let data = match fs::read_to_string(path) {
+    let data = match read_config_file(path) {
         Ok(data) => data,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return LoadOutcome::Fresh(migrate_old_format(path, legacy));
@@ -128,13 +133,29 @@ fn load_from(path: &Path, legacy: Option<&Path>) -> LoadOutcome {
     };
     match serde_json::from_str::<AppConfig>(&data) {
         Ok(mut config) => {
-            config.macros.truncate(MAX_MACROS);
-            for mac in &mut config.macros {
-                mac.clamp_to_valid_ranges();
-            }
+            sanitize_macros(&mut config.macros);
             LoadOutcome::Loaded(config)
         }
         Err(e) => LoadOutcome::Corrupt(format!("{} is not valid JSON: {e}", path.display())),
+    }
+}
+
+/// Read a config file, refusing oversized ones before any bytes are parsed.
+fn read_config_file(path: &Path) -> io::Result<String> {
+    let size = fs::metadata(path)?.len();
+    if size > MAX_CONFIG_BYTES {
+        return Err(io::Error::other(format!(
+            "config file is {size} bytes, larger than the {MAX_CONFIG_BYTES}-byte limit"
+        )));
+    }
+    fs::read_to_string(path)
+}
+
+/// Bring macros deserialized from disk into the ranges the app assumes.
+fn sanitize_macros(macros: &mut Vec<Macro>) {
+    macros.truncate(MAX_MACROS);
+    for mac in macros {
+        mac.clamp_to_valid_ranges();
     }
 }
 
@@ -151,17 +172,14 @@ fn migrate_old_format(target: &Path, legacy: Option<&Path>) -> AppConfig {
     let Some(candidate) = legacy else {
         return AppConfig::default();
     };
-    let Ok(data) = fs::read_to_string(candidate) else {
+    let Ok(data) = read_config_file(candidate) else {
         return AppConfig::default();
     };
     let Ok(mut macros) = serde_json::from_str::<Vec<Macro>>(&data) else {
         return AppConfig::default();
     };
 
-    macros.truncate(MAX_MACROS);
-    for mac in &mut macros {
-        mac.clamp_to_valid_ranges();
-    }
+    sanitize_macros(&mut macros);
     let config = AppConfig { macros, ..AppConfig::default() };
     if !target.exists() && save_to(target, &config).is_ok() {
         let _ = fs::remove_file(candidate);
@@ -187,6 +205,22 @@ mod tests {
             speed_multiplier: 2.5,
             macros: vec![Macro::new("first".into()), Macro::new("second".into())],
         }
+    }
+
+    #[test]
+    fn oversized_config_is_corrupt_not_parsed() {
+        let dir = temp_dir("oversized");
+        let path = dir.join(FILE_NAME);
+        fs::write(&path, "x").expect("write");
+        // Grow the file past the cap without materializing 64 MB in memory.
+        let f = fs::OpenOptions::new().write(true).open(&path).expect("open");
+        f.set_len(MAX_CONFIG_BYTES + 1).expect("set_len");
+        drop(f);
+
+        let outcome = load_from(&path, None);
+
+        assert!(matches!(outcome, LoadOutcome::Corrupt(ref e) if e.contains("limit")));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Round-trip through the on-disk envelope the binary actually writes,
