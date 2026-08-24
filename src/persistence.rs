@@ -67,17 +67,31 @@ fn dirs_fallback() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Write the config to disk atomically.
+/// Write the config to disk atomically and durably.
 ///
-/// Serializes to a sibling `.tmp` file and renames it over the target, so an
-/// interrupted write cannot truncate an existing config. The temp file is
-/// created fresh with owner-only permissions (macros can hold typed text) and
-/// removed if the rename fails.
+/// Serializes to a sibling `.tmp` file, flushes it to the platter, and renames
+/// it over the target, so neither an interrupted write nor a power loss can
+/// leave a truncated config behind. The temp file is created fresh with
+/// owner-only permissions (macros can hold typed text) and removed if the
+/// rename fails.
 pub fn save(config: &AppConfig) -> io::Result<()> {
     save_to(&config_path(), config)
 }
 
 fn save_to(path: &Path, config: &AppConfig) -> io::Result<()> {
+    // Clamp on the way out, not just on the way in. The load path trims
+    // anything past the limits, so writing an over-long macro means the file
+    // silently loses its tail at next launch — the write is where that
+    // divergence has to be caught, whatever the editor let through.
+    let mut config = AppConfig {
+        audio_enabled: config.audio_enabled,
+        macros_enabled: config.macros_enabled,
+        speed_multiplier: config.speed_multiplier,
+        macros: config.macros.clone(),
+    };
+    sanitize_macros(&mut config.macros);
+    let config = &config;
+
     let json = serde_json::to_string_pretty(config)
         .map_err(io::Error::other)?;
     let tmp = path.with_extension("json.tmp");
@@ -89,14 +103,32 @@ fn save_to(path: &Path, config: &AppConfig) -> io::Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
 
-    {
+    let write_tmp = || -> io::Result<()> {
         use io::Write;
         let mut file = options.open(&tmp)?;
         file.write_all(json.as_bytes())?;
-    }
+        // write_all only reaches the page cache. Without this the rename can
+        // be journalled while the data blocks are not, leaving a zero-length
+        // config after a power loss; it is also where a full disk finally
+        // reports ENOSPC, which dropping the File would swallow.
+        file.sync_all()
+    };
+    write_tmp().inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })?;
+
     fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
-    })
+    })?;
+
+    // Persist the rename itself. Best-effort: the data is already safe on
+    // disk, and some platforms refuse to open a directory for this.
+    if let Some(dir) = path.parent()
+        && let Ok(handle) = fs::File::open(dir)
+    {
+        let _ = handle.sync_all();
+    }
+    Ok(())
 }
 
 /// Outcome of reading the config file, distinguishing a fresh start from a
@@ -205,6 +237,41 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn save_clamps_so_the_file_survives_a_round_trip_unchanged() {
+        let dir = temp_dir("save-clamp");
+        let path = dir.join(FILE_NAME);
+        let mut mac = Macro::new("long".into());
+        mac.steps = vec![
+            crate::macro_def::MacroStep {
+                action: crate::macro_def::KeyAction::KeyDown(1),
+                delay_ms: 0,
+            };
+            crate::macro_def::MAX_STEPS + 10
+        ];
+        let config = AppConfig { macros: vec![mac], ..AppConfig::default() };
+        save_to(&path, &config).expect("save");
+
+        let LoadOutcome::Loaded(loaded) = load_from(&path, None) else {
+            panic!("expected a loaded config");
+        };
+        assert_eq!(
+            loaded.macros[0].steps.len(),
+            crate::macro_def::MAX_STEPS,
+            "what is written must equal what is read back"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_file_has_no_leftover_temp_beside_it() {
+        let dir = temp_dir("no-temp");
+        let path = dir.join(FILE_NAME);
+        save_to(&path, &sample_config()).expect("save");
+        assert!(!path.with_extension("json.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn sample_config() -> AppConfig {
