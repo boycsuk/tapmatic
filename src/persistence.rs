@@ -181,8 +181,17 @@ fn migrate_old_format(target: &Path, legacy: Option<&Path>) -> AppConfig {
 
     sanitize_macros(&mut macros);
     let config = AppConfig { macros, ..AppConfig::default() };
-    if !target.exists() && save_to(target, &config).is_ok() {
-        let _ = fs::remove_file(candidate);
+    // Reserve the target atomically: an exists() probe would race a config
+    // written between the check and the rename and clobber it.
+    let reserved = fs::OpenOptions::new().write(true).create_new(true).open(target);
+    if reserved.is_ok() {
+        if save_to(target, &config).is_ok() {
+            let _ = fs::remove_file(candidate);
+        } else {
+            // Do not leave the empty reservation behind: the next load would
+            // read it as a corrupt config and disable saving.
+            let _ = fs::remove_file(target);
+        }
     }
     config
 }

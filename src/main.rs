@@ -79,9 +79,12 @@ fn main() {
 
     input::begin_high_res_timer();
 
-    let (config, load_error) = match persistence::load() {
-        persistence::LoadOutcome::Loaded(c) | persistence::LoadOutcome::Fresh(c) => (c, None),
-        persistence::LoadOutcome::Corrupt(reason) => (persistence::AppConfig::default(), Some(reason)),
+    let (config, load_error, fresh) = match persistence::load() {
+        persistence::LoadOutcome::Loaded(c) => (c, None, false),
+        persistence::LoadOutcome::Fresh(c) => (c, None, true),
+        persistence::LoadOutcome::Corrupt(reason) => {
+            (persistence::AppConfig::default(), Some(reason), false)
+        }
     };
 
     let (event_tx, event_rx) = mpsc::channel::<AppEvent>();
@@ -97,6 +100,14 @@ fn main() {
     if let Some(reason) = load_error {
         state.config_read_failed = true;
         state.set_status_persistent(format!("Config not loaded ({reason}). Saving is disabled."));
+    } else if fresh {
+        if state.macros.is_empty() {
+            state.set_status(format!("First run — config will be saved to {}", persistence::FILE_NAME));
+        } else {
+            state.set_status(format!(
+                "Migrated {} macro(s) from the legacy macros.json", state.macros.len()
+            ));
+        }
     }
     AUDIO_ENABLED.store(state.audio_enabled, Ordering::SeqCst);
     MACROS_ENABLED.store(state.macros_enabled, Ordering::SeqCst);
@@ -266,6 +277,12 @@ fn commit_quick_recording(state: &mut AppState, mac: Macro) {
     let count = mac.steps.len();
     let idx = state.macros.len();
     state.macros.push(mac);
+    // The prompt named a macro that may no longer be the resolved selection.
+    state.confirm_delete = false;
+    // selected_macro indexes the filtered list; clear the filter so the raw
+    // index below points at the macro just recorded.
+    state.search_query.clear();
+    state.searching = false;
     state.selected_macro = idx;
     state.view = View::Main;
     state.set_status(format!("Quick recorded {} steps — edit with Space", count));
@@ -283,10 +300,12 @@ fn next_mouse_threshold(current: u32) -> u32 {
 
 /// Send a command to the executor, surfacing a dead executor thread instead
 /// of silently losing macro control.
-fn send_cmd(state: &mut AppState, cmd_tx: &mpsc::Sender<ExecutorCommand>, cmd: ExecutorCommand) {
+fn send_cmd(state: &mut AppState, cmd_tx: &mpsc::Sender<ExecutorCommand>, cmd: ExecutorCommand) -> bool {
     if cmd_tx.send(cmd).is_err() {
         state.set_status_persistent("Executor unavailable — macros cannot start or stop");
+        return false;
     }
+    true
 }
 
 /// Stop a macro: send the command, untrack it, and optionally beep.
@@ -315,7 +334,10 @@ fn start_macro(
     }
     let vk = mac.hotkey_vk;
     enforce_exclusive_group(state, &mac, cmd_tx);
-    send_cmd(state, cmd_tx, ExecutorCommand::StartMacro(mac));
+    if !send_cmd(state, cmd_tx, ExecutorCommand::StartMacro(mac)) {
+        // Nothing is running: marking it active would show ACTIVE forever.
+        return;
+    }
     // Chained macros may be unbound; vk 0 must not enter the active list.
     if vk != 0 {
         state.set_macro_active(vk, true);
@@ -373,6 +395,9 @@ fn handle_app_event(
             audio::play_deactivate();
         }
         AppEvent::ChainMacro(name) => {
+            if !state.macros.iter().any(|m| m.name == name) {
+                state.set_status(format!("Chain target '{}' not found", name));
+            }
             if let Some(mac) = state.macros.iter().find(|m| m.name == name) {
                 let mac = mac.clone();
                 // Chain starts obey the same gates as hotkey starts; an
@@ -419,6 +444,9 @@ fn handle_app_event(
                     let count = mac.steps.len();
                     let idx = state.macros.len();
                     state.macros.push(mac);
+                    state.confirm_delete = false;
+                    state.search_query.clear();
+                    state.searching = false;
                     state.config_macro_backup = None;
                     state.config_field = ConfigField::Name;
                     state.config_input_buf = state.macros[idx].name.clone();
@@ -672,9 +700,14 @@ fn handle_key_main(
             ModalOutcome::Committed(name) => {
                 if let Some(real_idx) = resolve_selected_macro(state)
                     && !name.is_empty() {
+                        let old_name = state.macros[real_idx].name.clone();
                         state.macros[real_idx].name = name.clone();
                         state.macros[real_idx].clamp_to_valid_ranges();
-                        state.set_status(format!("Renamed to '{}'", state.macros[real_idx].name));
+                        let new_name = state.macros[real_idx].name.clone();
+                        if new_name != old_name {
+                            retarget_chains(state, &old_name, &new_name);
+                        }
+                        state.set_status(format!("Renamed to '{}'", new_name));
                         autosave(state);
                     }
                 state.renaming = false;
@@ -718,8 +751,21 @@ fn handle_key_main(
                         stop_macro(state, vk, cmd_tx, false);
                     }
                     state.macros.remove(real_idx);
+                    let mut dangling = 0;
+                    for m in &mut state.macros {
+                        if m.chain_macro.as_deref() == Some(name.as_str()) {
+                            m.chain_macro = None;
+                            dangling += 1;
+                        }
+                    }
                     state.clamp_selection();
-                    state.set_status(format!("Deleted '{}'", name));
+                    if dangling > 0 {
+                        state.set_status(format!(
+                            "Deleted '{}' — cleared its chain reference in {} macro(s)", name, dangling
+                        ));
+                    } else {
+                        state.set_status(format!("Deleted '{}'", name));
+                    }
                     update_hotkey_config(state, hotkey_config);
                     autosave(state);
                 }
@@ -926,10 +972,9 @@ fn flush_pending_save(state: &mut AppState) {
     };
     match persistence::save(&config) {
         Ok(()) => state.unsaved_changes = false,
-        Err(e) => {
-            state.unsaved_changes = false;
-            state.set_status_persistent(format!("Save failed: {e}"));
-        }
+        // Keep the dirty flag: the failure may be transient (disk full, file
+        // locked), and clearing it would silently drop the session's edits.
+        Err(e) => state.set_status_persistent(format!("Save failed: {e} — will retry")),
     }
 }
 
@@ -1098,13 +1143,28 @@ fn handle_key_config(
     }
 }
 
+/// Point every `chain_macro` referencing `old` at `new`: chains are stored by
+/// name, so a rename would otherwise silently break them.
+fn retarget_chains(state: &mut AppState, old: &str, new: &str) {
+    for m in &mut state.macros {
+        if m.chain_macro.as_deref() == Some(old) {
+            m.chain_macro = Some(new.to_string());
+        }
+    }
+}
+
 fn apply_config_field(state: &mut AppState, idx: usize) {
     let input = state.config_input_buf.clone();
+    let old_name = state.macros[idx].name.clone();
     state.config_field.write(&mut state.macros[idx], &input);
     // Same bounds as the load path: without this, an in-session value past a
     // limit (jitter, delays, name length) is silently changed at next launch,
     // and an oversized jitter overflows the i32 math in the executor.
     state.macros[idx].clamp_to_valid_ranges();
+    let new_name = state.macros[idx].name.clone();
+    if new_name != old_name {
+        retarget_chains(state, &old_name, &new_name);
+    }
 }
 
 fn prefill_config_buf(state: &mut AppState, idx: usize) {
@@ -1697,6 +1757,64 @@ mod tests {
         assert_eq!(s.macros[0].name, "alpha");
         assert_eq!(s.undo_stack.len(), 1, "manual order must be undoable");
         assert!(s.unsaved_changes, "the sorted order must persist");
+    }
+
+    #[test]
+    fn delete_clears_chain_references_to_the_victim() {
+        let (tx, _rx, cfg) = main_harness();
+        let mut s = named_macros(&["target", "chainer"]);
+        s.macros[1].chain_macro = Some("target".into());
+        s.selected_macro = 0;
+        s.confirm_delete = true;
+
+        handle_key_main(&mut s, KeyCode::Enter, KeyModifiers::NONE, &tx, &cfg);
+
+        assert_eq!(s.macros.len(), 1);
+        assert_eq!(s.macros[0].chain_macro, None, "dangling chain must be cleared");
+    }
+
+    #[test]
+    fn config_rename_retargets_chain_references() {
+        let mut s = named_macros(&["old-name", "chainer"]);
+        s.macros[1].chain_macro = Some("old-name".into());
+        s.config_field = state::ConfigField::Name;
+        s.config_input_buf = "new-name".into();
+
+        apply_config_field(&mut s, 0);
+
+        assert_eq!(s.macros[0].name, "new-name");
+        assert_eq!(s.macros[1].chain_macro.as_deref(), Some("new-name"));
+    }
+
+    #[test]
+    fn chain_to_a_missing_target_reports_it() {
+        let (tx, rx, cfg) = main_harness();
+        let mut s = named_macros(&["m"]);
+
+        handle_app_event(&mut s, AppEvent::ChainMacro("gone".into()), &tx, &cfg);
+
+        assert!(rx.try_recv().is_err());
+        assert!(
+            s.status_message.as_ref().is_some_and(|(m, _, _)| m.contains("not found")),
+            "a dangling chain must be reported, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn quick_record_commit_invalidates_filter_and_prompt() {
+        let mut s = named_macros(&["alpha", "beta"]);
+        s.search_query = "alpha".into();
+        s.searching = true;
+        s.confirm_delete = true;
+        let mut mac = Macro::new("recorded".into());
+        mac.steps.push(MacroStep { action: KeyAction::KeyDown(0x41), delay_ms: 0 });
+
+        commit_quick_recording(&mut s, mac);
+
+        assert!(s.search_query.is_empty(), "filter must not survive the commit");
+        assert!(!s.searching);
+        assert!(!s.confirm_delete, "a pending delete prompt now names the wrong macro");
+        assert_eq!(s.macros[s.selected_macro].name, "recorded");
     }
 
     #[test]

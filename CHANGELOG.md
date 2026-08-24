@@ -17,6 +17,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The config file was read and parsed with no size limit, so a multi-gigabyte
   `.tapmatic.json` caused unbounded memory use at every startup. Files over
   64 MB are now refused before parsing and reported as corrupt.
+- A failed autosave cleared the dirty flag, so the edits were never retried
+  and the quit-path flushes wrote nothing: one transient write failure lost
+  the session. The flag now survives failures and the save retries.
+- Deleting or renaming a macro left other macros' `chain_macro` references
+  dangling, silently breaking their chains; a chain to a missing name also
+  failed with no feedback. Renames now retarget references, deletes clear
+  them (reporting how many), and a dangling chain is named in the status bar.
+- A pending delete confirmation survived a quick recording that changed the
+  macro list, so Enter deleted a different macro than the prompt named; the
+  commit also bypassed an active search filter, desyncing the selection.
+  Committing a recording now cancels the prompt and clears the filter.
+- Starting a macro when the executor thread was dead still marked it ACTIVE
+  and played the activation sound, misreporting forever.
+- The legacy-migration guard against overwriting a config that appeared
+  mid-migration used a non-atomic exists-then-rename; the target is now
+  reserved atomically.
+- The first run (or a legacy migration) now reports itself in the status bar
+  instead of being indistinguishable from a normal load.
 - In-session edits bypassed every load-time bound: a huge mouse-jitter or
   scroll-clicks value overflowed the executor's i32 math (garbage input
   injected system-wide in release builds), and oversized names, TypeText
