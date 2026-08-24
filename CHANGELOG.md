@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- CI/release workflows: third-party actions are pinned to commit SHAs (with
+  Dependabot proposing bumps), CI's token is now explicitly read-only, the
+  release binary is built without a cache so it is always a clean build of
+  the tagged commit, and every release now ships a `SHA256SUMS.txt`.
+
 ### Fixed
 
 - A macro name (or group/chain/process string) containing control characters
