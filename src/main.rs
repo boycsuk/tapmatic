@@ -1626,6 +1626,17 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
     }
 }
 
+/// Apply a picker's shared Up/Down navigation, reporting whether it consumed
+/// the key so the caller's match can fall through to its own arms.
+fn picker_nav(key: KeyCode, selected: &mut usize, len: usize) -> bool {
+    match key {
+        KeyCode::Up => wrap_nav(selected, len, true),
+        KeyCode::Down => wrap_nav(selected, len, false),
+        _ => return false,
+    }
+    true
+}
+
 fn handle_key_process_picker(state: &mut AppState, key: KeyCode) {
     let idx = match state.view {
         View::ProcessPicker(i) => i,
@@ -1636,8 +1647,7 @@ fn handle_key_process_picker(state: &mut AppState, key: KeyCode) {
         KeyCode::Esc => {
             state.view = View::Config(idx);
         }
-        KeyCode::Up => wrap_nav(&mut state.selected_process, state.process_list.len(), true),
-        KeyCode::Down => wrap_nav(&mut state.selected_process, state.process_list.len(), false),
+        _ if picker_nav(key, &mut state.selected_process, state.process_list.len()) => {}
         KeyCode::Enter => {
             if let Some((exe, _)) = state.process_list.get(state.selected_process) {
                 state.macros[idx].bound_process = Some(exe.clone());
@@ -1674,8 +1684,7 @@ fn handle_key_chain_picker(state: &mut AppState, key: KeyCode) {
         KeyCode::Esc => {
             state.view = View::Config(idx);
         }
-        KeyCode::Up => wrap_nav(&mut state.selected_chain, state.chain_list.len(), true),
-        KeyCode::Down => wrap_nav(&mut state.selected_chain, state.chain_list.len(), false),
+        _ if picker_nav(key, &mut state.selected_chain, state.chain_list.len()) => {}
         KeyCode::Enter => {
             if let Some(name) = state.chain_list.get(state.selected_chain) {
                 state.macros[idx].chain_macro = Some(name.clone());
