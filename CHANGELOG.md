@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A macro with zero steps was startable and became an unstoppable busy loop:
+  no iteration ever read the stop flag, `stop()` joined forever and quitting
+  hung the app. Empty macros are now refused at start and the executor loop
+  checks the stop flag every cycle.
+- Copying or duplicating steps with a selection anchor left over from a
+  longer macro panicked: the anchor was never reset when entering the step
+  editor and the selection range was not clamped to the step list.
+- Opening a macro's config with a text cursor left over from a longer buffer
+  (e.g. the search field) panicked on Backspace or Ctrl+Left: `enter_config`
+  never reset the cursor.
+
 ## [0.1.0] - 2026-08-23
 
 ### Fixed

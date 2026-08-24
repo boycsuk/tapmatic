@@ -754,7 +754,7 @@ fn draw_step_editor(f: &mut Frame, state: &AppState, idx: usize) {
     ])
     .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
 
-    let (sel_start, sel_end) = state.step_selection_range();
+    let (sel_start, sel_end) = state.step_selection_range(mac.steps.len());
 
     let rows: Vec<Row> = mac
         .steps

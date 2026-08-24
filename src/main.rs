@@ -299,6 +299,10 @@ fn start_macro(
     mac: Macro,
     cmd_tx: &mpsc::Sender<ExecutorCommand>,
 ) {
+    if mac.steps.is_empty() {
+        state.set_status("Macro has no steps - nothing to start");
+        return;
+    }
     let vk = mac.hotkey_vk;
     enforce_exclusive_group(state, &mac, cmd_tx);
     send_cmd(state, cmd_tx, ExecutorCommand::StartMacro(mac));
@@ -636,6 +640,7 @@ fn enter_config(state: &mut AppState, idx: usize) {
     state.config_tab = 0;
     state.config_field = ConfigField::Name;
     state.config_input_buf = state.macros[idx].name.clone();
+    state.text_cursor = state.config_input_buf.chars().count();
     state.awaiting_hotkey = false;
     state.view = View::Config(idx);
 }
@@ -1060,6 +1065,7 @@ fn handle_key_config(
         KeyCode::F(1) => {
             apply_config_field(state, idx);
             state.selected_step = 0;
+            state.selection_anchor = None;
             state.editing_step_delay = false;
             state.step_delay_buf.clear();
             state.view = View::StepEditor(idx);
@@ -1268,15 +1274,13 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
         KeyCode::Down => wrap_nav(&mut state.selected_step, step_count, false),
         KeyCode::Char('d') | KeyCode::Char('D')
             if step_count > 0 => {
-                let (start, end) = state.step_selection_range();
-                if end < step_count {
-                    let count = end - start + 1;
-                    state.macros[idx].steps.drain(start..=end);
-                    let new_len = state.macros[idx].steps.len();
-                    state.selected_step = if new_len == 0 { 0 } else { start.min(new_len - 1) };
-                    state.selection_anchor = None;
-                    state.set_status(format!("Deleted {} step(s)", count));
-                }
+                let (start, end) = state.step_selection_range(step_count);
+                let count = end - start + 1;
+                state.macros[idx].steps.drain(start..=end);
+                let new_len = state.macros[idx].steps.len();
+                state.selected_step = if new_len == 0 { 0 } else { start.min(new_len - 1) };
+                state.selection_anchor = None;
+                state.set_status(format!("Deleted {} step(s)", count));
             }
         KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Enter => {
             if let Some(step) = state.macros[idx].steps.get(state.selected_step) {
@@ -1377,7 +1381,7 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
         }
         KeyCode::Char('c') | KeyCode::Char('C')
             if step_count > 0 => {
-                let (start, end) = state.step_selection_range();
+                let (start, end) = state.step_selection_range(step_count);
                 let duped = state.macros[idx].steps[start..=end].to_vec();
                 let count = duped.len();
                 for (i, step) in duped.into_iter().enumerate() {
@@ -1389,7 +1393,7 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             }
         KeyCode::Char('y') | KeyCode::Char('Y')
             if step_count > 0 => {
-                let (start, end) = state.step_selection_range();
+                let (start, end) = state.step_selection_range(step_count);
                 state.clipboard_steps = state.macros[idx].steps[start..=end].to_vec();
                 let count = state.clipboard_steps.len();
                 state.set_status(format!("Copied {} step(s)", count));
@@ -1622,6 +1626,8 @@ mod tests {
         for (i, name) in names.iter().enumerate() {
             let mut mac = Macro::new((*name).into());
             mac.hotkey_vk = 0x41 + i as i32;
+            // Startable fixtures need at least one step: empty macros are refused.
+            mac.steps.push(MacroStep { action: KeyAction::KeyDown(0x41), delay_ms: 0 });
             s.macros.push(mac);
         }
         s
@@ -1669,6 +1675,30 @@ mod tests {
         assert_eq!(s.macros[0].name, "alpha");
         assert_eq!(s.undo_stack.len(), 1, "manual order must be undoable");
         assert!(s.unsaved_changes, "the sorted order must persist");
+    }
+
+    #[test]
+    fn empty_macro_is_refused_at_start() {
+        let (tx, rx, _cfg) = main_harness();
+        let mut s = named_macros(&["m"]);
+        s.macros[0].steps.clear();
+        let vk = s.macros[0].hotkey_vk;
+
+        let mac = s.macros[0].clone();
+        start_macro(&mut s, mac, &tx);
+
+        assert!(rx.try_recv().is_err(), "no command may reach the executor");
+        assert!(!s.is_macro_active(vk));
+    }
+
+    #[test]
+    fn enter_config_resets_the_text_cursor() {
+        let mut s = named_macros(&["ab"]);
+        s.text_cursor = 10; // stale from a longer buffer (e.g. the search field)
+
+        enter_config(&mut s, 0);
+
+        assert_eq!(s.text_cursor, 2);
     }
 
     #[test]

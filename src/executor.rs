@@ -254,6 +254,10 @@ fn execute_macro_inner(
         }
 
     loop {
+        if should_stop(stop_flag) {
+            return;
+        }
+
         for step in &mac.steps {
             if should_stop(stop_flag) {
                 return;

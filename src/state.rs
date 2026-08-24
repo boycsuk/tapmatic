@@ -564,11 +564,15 @@ impl AppState {
         }
     }
 
-    pub fn step_selection_range(&self) -> (usize, usize) {
+    pub fn step_selection_range(&self, step_count: usize) -> (usize, usize) {
+        let last = step_count.saturating_sub(1);
         if let Some(anchor) = self.selection_anchor {
-            (anchor.min(self.selected_step), anchor.max(self.selected_step))
+            (
+                anchor.min(self.selected_step).min(last),
+                anchor.max(self.selected_step).min(last),
+            )
         } else {
-            (self.selected_step, self.selected_step)
+            (self.selected_step.min(last), self.selected_step.min(last))
         }
     }
 
@@ -845,7 +849,7 @@ mod tests {
     fn step_selection_range_no_anchor() {
         let mut s = AppState::new();
         s.selected_step = 5;
-        assert_eq!(s.step_selection_range(), (5, 5));
+        assert_eq!(s.step_selection_range(10), (5, 5));
     }
 
     #[test]
@@ -853,11 +857,24 @@ mod tests {
         let mut s = AppState::new();
         s.selected_step = 7;
         s.selection_anchor = Some(3);
-        assert_eq!(s.step_selection_range(), (3, 7));
+        assert_eq!(s.step_selection_range(10), (3, 7));
 
         s.selected_step = 1;
         s.selection_anchor = Some(5);
-        assert_eq!(s.step_selection_range(), (1, 5));
+        assert_eq!(s.step_selection_range(10), (1, 5));
+    }
+
+    #[test]
+    fn step_selection_range_clamps_stale_anchor() {
+        // Anchor left over from a longer macro must not index past the list.
+        let mut s = AppState::new();
+        s.selected_step = 7;
+        s.selection_anchor = Some(3);
+        assert_eq!(s.step_selection_range(2), (1, 1));
+        s.selection_anchor = None;
+        s.selected_step = 9;
+        assert_eq!(s.step_selection_range(2), (1, 1));
+        assert_eq!(s.step_selection_range(0), (0, 0));
     }
 
     #[test]
