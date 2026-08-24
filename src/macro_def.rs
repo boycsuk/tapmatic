@@ -69,9 +69,9 @@ impl KeyAction {
     /// Returns None for unrecognized VKs with scancode 0.
     pub fn from_vk(vk: i32, scancode: u16, down: bool) -> Option<Self> {
         match vk {
-            0x01 => Some(if down { Self::MouseDown(MouseButton::Left) } else { Self::MouseUp(MouseButton::Left) }),
-            0x02 => Some(if down { Self::MouseDown(MouseButton::Right) } else { Self::MouseUp(MouseButton::Right) }),
-            0x04 => Some(if down { Self::MouseDown(MouseButton::Middle) } else { Self::MouseUp(MouseButton::Middle) }),
+            VK_LBUTTON => Some(if down { Self::MouseDown(MouseButton::Left) } else { Self::MouseUp(MouseButton::Left) }),
+            VK_RBUTTON => Some(if down { Self::MouseDown(MouseButton::Right) } else { Self::MouseUp(MouseButton::Right) }),
+            VK_MBUTTON => Some(if down { Self::MouseDown(MouseButton::Middle) } else { Self::MouseUp(MouseButton::Middle) }),
             _ if scancode != 0 => Some(if down { Self::KeyDown(scancode) } else { Self::KeyUp(scancode) }),
             _ => None,
         }
@@ -396,6 +396,12 @@ pub fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) {
     }
     s.truncate(end);
 }
+
+pub const VK_LBUTTON: i32 = 0x01;
+pub const VK_RBUTTON: i32 = 0x02;
+pub const VK_MBUTTON: i32 = 0x04;
+pub const VK_XBUTTON1: i32 = 0x05;
+pub const VK_XBUTTON2: i32 = 0x06;
 
 /// Virtual-key codes are a byte; 0 means "unbound".
 pub fn is_valid_vk(vk: i32) -> bool {

@@ -19,6 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bar, and the macro table marks the combination with `[W?]`: without a
   process, Window mode silently runs as global focus-dependent input.
 
+### Changed
+
+- Confirmed semantic duplication folded onto single owners: the stop-recording
+  transition (QuickRecordToggle now routes through RecordStop), the Config
+  entry path (which also inherited a stale tab when opened after a recording),
+  the recorder's capture reset, the audio playback scaffold, the insert-after-
+  selection rule, the config view's arrow-key motion, and the speed display
+  (the status bar and toast could show different precision). Behavioral magic
+  numbers got names (mouse VK codes, mode settle window, status TTL, undo cap,
+  stop-condition defaults, default mouse threshold).
+- Window-mode posts now report `PostMessageW` failures, so the executor's
+  retry loop covers a failed post instead of reporting success while sending
+  nothing; `get_cursor_pos` failure is now distinguishable from a cursor at
+  (0,0), so recording no longer writes a jump-to-origin step when the query
+  fails; and the console title is rebuilt on the existing poll cadence
+  instead of every frame.
+
 ### Security
 
 - CI/release workflows: third-party actions are pinned to commit SHAs (with

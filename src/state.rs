@@ -340,6 +340,11 @@ pub struct AppState {
 
 }
 
+/// Non-persistent status messages disappear after this many seconds.
+const STATUS_MESSAGE_TTL_SECS: u64 = 3;
+/// Snapshots kept for F-key undo; each one clones the whole macro list.
+const UNDO_STACK_CAP: usize = 20;
+
 impl AppState {
     pub fn new() -> Self {
         Self {
@@ -362,7 +367,7 @@ impl AppState {
             recording_pressed_mouse: HashSet::new(),
             recording_paused: false,
             recording_mouse_moves: false,
-            mouse_move_threshold: 5,
+            mouse_move_threshold: crate::DEFAULT_MOUSE_MOVE_THRESHOLD,
             config_field: ConfigField::Name,
             config_tab: 0,
             config_input_buf: String::new(),
@@ -421,9 +426,17 @@ impl AppState {
 
     pub fn clear_stale_status(&mut self) {
         if let Some((_, t, persistent)) = &self.status_message
-            && !persistent && t.elapsed().as_secs() >= 3 {
+            && !persistent && t.elapsed().as_secs() >= STATUS_MESSAGE_TTL_SECS {
                 self.status_message = None;
             }
+    }
+
+    /// The user-facing speed factor, or `None` at normal speed.
+    ///
+    /// `speed_multiplier` scales delays (0.5 = half the delay), so the number
+    /// people think of as "speed" is its reciprocal.
+    pub fn speed_display(&self) -> Option<f64> {
+        ((self.speed_multiplier - 1.0).abs() > 0.01).then(|| 1.0 / self.speed_multiplier)
     }
 
     pub fn is_macro_active(&self, vk: i32) -> bool {
@@ -548,7 +561,7 @@ impl AppState {
     }
 
     pub fn push_undo(&mut self) {
-        if self.undo_stack.len() >= 20 {
+        if self.undo_stack.len() >= UNDO_STACK_CAP {
             self.undo_stack.remove(0);
         }
         self.undo_stack.push(self.macros.clone());

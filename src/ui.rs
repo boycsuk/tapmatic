@@ -47,10 +47,9 @@ fn status_bar(state: &AppState) -> Line<'_> {
         Span::styled(" MUTE ", Style::default().fg(WHITE).bg(DIM))
     };
 
-    let speed_span = if (state.speed_multiplier - 1.0).abs() > 0.01 {
-        let display = 1.0 / state.speed_multiplier;
+    let speed_span = if let Some(display) = state.speed_display() {
         Span::styled(
-            format!(" x{:.1} ", display),
+            format!(" x{:.2} ", display),
             Style::default().fg(Color::Black).bg(YELLOW),
         )
     } else {

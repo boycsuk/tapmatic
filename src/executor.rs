@@ -299,6 +299,8 @@ fn execute_macro_inner(
                 mac.fixed_interval_ms
             };
 
+            // Gate here, not just in apply_humanize: the call advances the
+            // RNG, and a disabled feature must not consume random numbers.
             let humanized = if mac.humanize_ms > 0 && raw_delay > 0 {
                 apply_humanize(raw_delay, mac.humanize_ms, input::xorshift64(&mut rng_state))
             } else {
@@ -343,6 +345,8 @@ fn execute_macro_inner(
                     thread::sleep(Duration::from_millis(50));
                 }
             } else {
+                // Same reason as the humanize gate: don't advance the RNG
+                // for a feature that is off.
                 let sent = if mac.mouse_jitter > 0 {
                     input::execute_action_with_jitter(
                         &step.action,

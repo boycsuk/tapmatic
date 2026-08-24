@@ -28,7 +28,16 @@ pub static CAPTURE_MOUSE_BUTTONS: AtomicBool = AtomicBool::new(false);
 pub static SPEED_MULTIPLIER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x3FF0000000000000); // 1.0f64 as bits
 pub static QUICK_RECORD: AtomicBool = AtomicBool::new(false);
 pub static RECORD_MOUSE_MOVES: AtomicBool = AtomicBool::new(false);
-pub static MOUSE_MOVE_THRESHOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(5);
+pub static MOUSE_MOVE_THRESHOLD: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(DEFAULT_MOUSE_MOVE_THRESHOLD);
+
+/// Startup value for both the recorder atomic and `AppState`; must stay a
+/// member of `MOUSE_THRESHOLDS` or F3 cycling restarts from the list head.
+pub const DEFAULT_MOUSE_MOVE_THRESHOLD: u32 = 5;
+
+/// Starting values when cycling a stop condition onto reps/seconds.
+const DEFAULT_STOP_REPS: u32 = 10;
+const DEFAULT_STOP_SECS: u32 = 30;
 
 pub const MAIN_BUTTONS: &[&str] = &[
     "Record", "Edit", "Copy", "Delete", "Save", "Toggle", "Mute", "Quit",
@@ -187,22 +196,26 @@ fn run_app(
             state.uptime_secs = app_start.elapsed().as_secs();
         }
 
-        // Update console title (visible in taskbar when minimized)
-        let title = if state.view == View::Recording {
-            format!("tapmatic - REC ({} steps)", state.recording_steps.len())
-        } else if !state.active_macros.is_empty() {
-            let names: Vec<&str> = state
-                .active_macros
-                .iter()
-                .filter_map(|&vk| state.macros.iter().find(|m| m.hotkey_vk == vk).map(|m| m.name.as_str()))
-                .collect();
-            format!("tapmatic - ACTIVE: {}", names.join(", "))
-        } else {
-            "tapmatic".into()
-        };
-        if title != last_title {
-            let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(&title));
-            last_title = title;
+        // Update console title (visible in taskbar when minimized). Its
+        // inputs change at human speed; rebuilding the string every frame
+        // is allocation churn for a value that compares equal.
+        if frame_count.is_multiple_of(FOREGROUND_POLL_FRAMES) {
+            let title = if state.view == View::Recording {
+                format!("tapmatic - REC ({} steps)", state.recording_steps.len())
+            } else if !state.active_macros.is_empty() {
+                let names: Vec<&str> = state
+                    .active_macros
+                    .iter()
+                    .filter_map(|&vk| state.macros.iter().find(|m| m.hotkey_vk == vk).map(|m| m.name.as_str()))
+                    .collect();
+                format!("tapmatic - ACTIVE: {}", names.join(", "))
+            } else {
+                "tapmatic".into()
+            };
+            if title != last_title {
+                let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(&title));
+                last_title = title;
+            }
         }
 
         terminal.draw(|f| ui::draw(f, state))?;
@@ -412,16 +425,9 @@ fn handle_app_event(
         }
         AppEvent::QuickRecordToggle => {
             if state.view == View::Recording {
-                // Stop quick-recording
-                let mac = recorder::stop_recording(state);
-                audio::play_record_stop();
-                if mac.steps.is_empty() {
-                    state.view = View::Main;
-                    state.set_status("Quick record cancelled — no keys captured");
-                } else {
-                    commit_quick_recording(state, mac);
-                }
-                QUICK_RECORD.store(false, Ordering::SeqCst);
+                // Same transition as RecordStop; QUICK_RECORD routes the
+                // commit, so the stop sequence exists exactly once.
+                handle_app_event(state, AppEvent::RecordStop, cmd_tx, hotkey_config);
             } else if state.view == View::Main && can_add_macro(state) {
                 recorder::start_recording(state);
                 QUICK_RECORD.store(true, Ordering::SeqCst);
@@ -448,13 +454,8 @@ fn handle_app_event(
                     state.confirm_delete = false;
                     state.search_query.clear();
                     state.searching = false;
-                    state.config_macro_backup = None;
-                    state.config_field = ConfigField::Name;
-                    state.config_input_buf = state.macros[idx].name.clone();
-                    state.text_cursor = state.config_input_buf.chars().count();
-                    state.awaiting_hotkey = false;
                     state.selected_macro = idx;
-                    state.view = View::Config(idx);
+                    enter_config(state, idx, ConfigEntry::FreshRecording);
                     update_hotkey_config(state, hotkey_config);
                     state.set_status(format!("Recorded {} steps — configure your macro", count));
                 }
@@ -594,9 +595,8 @@ fn capture_key_pair_insert(state: &mut AppState, vk: i32) {
         KeyAction::from_vk(vk, sc, true),
         KeyAction::from_vk(vk, sc, false),
     ) {
-        let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
         let name = action_down.display_name();
-        state.macros[idx].steps.insert(pos, MacroStep { action: action_down, delay_ms: 0 });
+        let pos = insert_step_after_selection(state, idx, MacroStep { action: action_down, delay_ms: 0 });
         state.macros[idx].steps.insert(pos + 1, MacroStep { action: action_up, delay_ms: 50 });
         state.selected_step = pos;
         state.set_status(format!("Inserted {} (down+up)", name));
@@ -639,7 +639,7 @@ fn activate_button(
         }
         BTN_EDIT => {
             if let Some(real_idx) = resolve_selected_macro(state) {
-                enter_config(state, real_idx);
+                enter_config(state, real_idx, ConfigEntry::ExistingMacro);
             } else {
                 state.set_status("No macros to edit. Record one first");
             }
@@ -714,10 +714,23 @@ fn resolve_selected_macro(state: &AppState) -> Option<usize> {
     filtered.get(state.selected_macro).copied()
 }
 
-fn enter_config(state: &mut AppState, idx: usize) {
+/// How the Config view is being opened.
+#[derive(Clone, Copy, PartialEq)]
+enum ConfigEntry {
+    /// Editing an existing macro: undoable, Esc reverts to a backup.
+    ExistingMacro,
+    /// Configuring a just-recorded macro: nothing to revert to.
+    FreshRecording,
+}
+
+fn enter_config(state: &mut AppState, idx: usize, entry: ConfigEntry) {
     state.clear_status();
-    state.push_undo();
-    state.config_macro_backup = Some(state.macros[idx].clone());
+    if entry == ConfigEntry::ExistingMacro {
+        state.push_undo();
+        state.config_macro_backup = Some(state.macros[idx].clone());
+    } else {
+        state.config_macro_backup = None;
+    }
     state.config_tab = 0;
     state.config_field = ConfigField::Name;
     state.config_input_buf = state.macros[idx].name.clone();
@@ -845,7 +858,7 @@ fn handle_key_main(
 
         KeyCode::Char(' ') => {
             if let Some(real_idx) = resolve_selected_macro(state) {
-                enter_config(state, real_idx);
+                enter_config(state, real_idx, ConfigEntry::ExistingMacro);
             } else if can_add_macro(state) {
                 recorder::start_recording(state);
                 update_hotkey_config(state, hotkey_config);
@@ -919,10 +932,9 @@ fn handle_key_main(
                 _ => 1.0,
             };
             SPEED_MULTIPLIER.store(state.speed_multiplier.to_bits(), Ordering::SeqCst);
-            let label = if (state.speed_multiplier - 1.0).abs() < 0.01 {
-                "Speed: x1.00 (reset)".to_string()
-            } else {
-                format!("Speed: x{:.2}", 1.0 / state.speed_multiplier)
+            let label = match state.speed_display() {
+                None => "Speed: x1.00 (reset)".to_string(),
+                Some(display) => format!("Speed: x{:.2}", display),
             };
             state.set_status(label);
             autosave(state);
@@ -1089,12 +1101,12 @@ fn handle_key_config(
                 }
                 ConfigField::StopCondition => {
                     state.macros[idx].stop_condition = match (state.macros[idx].stop_condition, forward) {
-                        (StopCondition::None, true) => StopCondition::AfterReps(10),
-                        (StopCondition::None, false) => StopCondition::AfterSecs(30),
-                        (StopCondition::AfterReps(_), true) => StopCondition::AfterSecs(30),
+                        (StopCondition::None, true) => StopCondition::AfterReps(DEFAULT_STOP_REPS),
+                        (StopCondition::None, false) => StopCondition::AfterSecs(DEFAULT_STOP_SECS),
+                        (StopCondition::AfterReps(_), true) => StopCondition::AfterSecs(DEFAULT_STOP_SECS),
                         (StopCondition::AfterReps(_), false) => StopCondition::None,
                         (StopCondition::AfterSecs(_), true) => StopCondition::None,
-                        (StopCondition::AfterSecs(_), false) => StopCondition::AfterReps(10),
+                        (StopCondition::AfterSecs(_), false) => StopCondition::AfterReps(DEFAULT_STOP_REPS),
                     };
                 }
                 ConfigField::SendMode => {
@@ -1113,13 +1125,13 @@ fn handle_key_config(
                     }
                 }
                 _ => {
-                    // Text/numeric fields: cursor movement (including Ctrl+Arrow word jump)
+                    // Text/numeric fields: same motion semantics as every
+                    // other buffer, via the shared handler.
                     if state.config_field.is_text_field() || state.config_field.is_numeric_field() {
-                        let ctrl = mods.contains(KeyModifiers::CONTROL);
-                        if ctrl && !forward { state.buf_cursor_word_left(&state.config_input_buf.clone()); }
-                        else if ctrl && forward { state.buf_cursor_word_right(&state.config_input_buf.clone()); }
-                        else if forward { state.buf_cursor_right(state.config_input_buf.chars().count()); }
-                        else { state.buf_cursor_left(); }
+                        let mut buf = state.config_input_buf.clone();
+                        let key = if forward { KeyCode::Right } else { KeyCode::Left };
+                        handle_text_motion(state, &mut buf, key, mods, false, false);
+                        state.config_input_buf = buf;
                     }
                 }
             }
@@ -1471,7 +1483,7 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             state.set_status("Inserted Scroll Down");
         }
         KeyCode::Char('m') | KeyCode::Char('M') => {
-            let (cx, cy) = input::get_cursor_pos();
+            let (cx, cy) = input::get_cursor_pos().unwrap_or((0, 0));
             let step = MacroStep {
                 action: KeyAction::MouseMove(cx, cy),
                 delay_ms: 0,
@@ -1522,10 +1534,11 @@ fn handle_key_step_editor(state: &mut AppState, key: KeyCode, mods: KeyModifiers
             }
         KeyCode::Char('p') | KeyCode::Char('P') => {
             if !state.clipboard_steps.is_empty() {
-                let pos = (state.selected_step + 1).min(state.macros[idx].steps.len());
                 let count = state.clipboard_steps.len();
-                for (i, step) in state.clipboard_steps.clone().into_iter().enumerate() {
-                    state.macros[idx].steps.insert(pos + i, step);
+                let mut steps = state.clipboard_steps.clone().into_iter();
+                let pos = insert_step_after_selection(state, idx, steps.next().expect("non-empty"));
+                for (i, step) in steps.enumerate() {
+                    state.macros[idx].steps.insert(pos + 1 + i, step);
                 }
                 state.selected_step = pos;
                 state.selection_anchor = None;
@@ -1939,7 +1952,7 @@ mod tests {
         let mut s = named_macros(&["ab"]);
         s.text_cursor = 10; // stale from a longer buffer (e.g. the search field)
 
-        enter_config(&mut s, 0);
+        enter_config(&mut s, 0, ConfigEntry::ExistingMacro);
 
         assert_eq!(s.text_cursor, 2);
     }
