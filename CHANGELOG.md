@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-24
+
+### Changed
+
+- New application icon: an isometric amber block with a graphite top face and
+  an inlaid chevron, replacing the grey placeholder hash. The `.ico` now ships
+  16/32/48/256 px variants, each rendered at its own scale with an alpha
+  channel, so Windows no longer downscales a single 256 px image for the
+  taskbar.
+
+### Removed
+
+- `tapmatic.png` — an unreferenced duplicate of the old icon; `app.rc` embeds
+  `tapmatic.ico` and nothing read the PNG.
+
 ## [0.2.0] - 2026-08-24
 
 ### Added
