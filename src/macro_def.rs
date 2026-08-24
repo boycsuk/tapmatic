@@ -116,6 +116,30 @@ fn mouse_button_name(b: MouseButton) -> &'static str {
 }
 
 fn scancode_name(sc: u16) -> String {
+    // Extended keys share their low byte with a numpad key, so they must be
+    // named from the prefixed form or an arrow reads as "SC:0x48".
+    let (sc, extended) = crate::input::split_scancode(sc);
+    if extended {
+        return match sc {
+            0x1C => "NumEnter".into(),
+            0x1D => "RCtrl".into(),
+            0x35 => "NumDivide".into(),
+            0x38 => "RAlt".into(),
+            0x47 => "Home".into(),
+            0x48 => "Up".into(),
+            0x49 => "PageUp".into(),
+            0x4B => "Left".into(),
+            0x4D => "Right".into(),
+            0x4F => "End".into(),
+            0x50 => "Down".into(),
+            0x51 => "PageDown".into(),
+            0x52 => "Insert".into(),
+            0x53 => "Delete".into(),
+            0x5B => "LWin".into(),
+            0x5C => "RWin".into(),
+            _ => format!("SC:E0{:02X}", sc),
+        };
+    }
     match sc {
         0x01 => "Esc".into(),
         0x02..=0x0B => {
@@ -167,6 +191,16 @@ fn scancode_name(sc: u16) -> String {
         0x42 => "F8".into(),
         0x43 => "F9".into(),
         0x44 => "F10".into(),
+        0x47 => "Num7".into(),
+        0x48 => "Num8".into(),
+        0x49 => "Num9".into(),
+        0x4B => "Num4".into(),
+        0x4C => "Num5".into(),
+        0x4D => "Num6".into(),
+        0x4F => "Num1".into(),
+        0x50 => "Num2".into(),
+        0x51 => "Num3".into(),
+        0x52 => "Num0".into(),
         0x57 => "F11".into(),
         0x58 => "F12".into(),
         _ => format!("SC:{:#04X}", sc),
@@ -599,6 +633,15 @@ pub fn vk_name(vk: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extended_scancodes_are_named_apart_from_their_numpad_twins() {
+        assert_eq!(scancode_name(0xE048), "Up");
+        assert_eq!(scancode_name(0x48), "Num8");
+        assert_eq!(scancode_name(0xE04B), "Left");
+        assert_eq!(scancode_name(0xE01D), "RCtrl");
+        assert_eq!(scancode_name(0x1D), "LCtrl");
+    }
 
     #[test]
     fn repetition_mode_cycle() {

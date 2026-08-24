@@ -4,6 +4,25 @@ use crate::macro_def::KeyAction;
 #[cfg(windows)]
 const WHEEL_DELTA: i32 = 120;
 
+/// The `0xE0` prefix byte that marks an extended scancode, stored in the high
+/// byte of a recorded scancode.
+pub const EXTENDED_PREFIX: u16 = 0xE000;
+
+/// Split a stored scancode into its 8-bit hardware code and whether it is
+/// extended.
+///
+/// Extended keys (the arrow cluster, Insert/Delete/Home/End/PageUp/PageDown,
+/// right Ctrl and Alt, numpad Enter and Divide) share their low byte with a
+/// numpad key, so the prefix is what tells the two apart. Recorded scancodes
+/// carry it in the high byte; anything below `0xE000` is a plain key.
+pub fn split_scancode(scancode: u16) -> (u16, bool) {
+    if scancode & 0xFF00 == EXTENDED_PREFIX {
+        (scancode & 0x00FF, true)
+    } else {
+        (scancode, false)
+    }
+}
+
 // Only compiled on Windows. The non-Windows stubs below are no-ops that let
 // the crate build and the suite run off-Windows; no test exercising them
 // proves anything about real input behaviour.
@@ -12,24 +31,32 @@ const WHEEL_DELTA: i32 = 120;
 mod platform {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MapVirtualKeyA, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
-        KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC,
-        MAP_VIRTUAL_KEY_TYPE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+        KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+        KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX, MAP_VIRTUAL_KEY_TYPE, MOUSEEVENTF_ABSOLUTE,
+        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
         MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT,
-        MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
+        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+        MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
     };
 
     use crate::macro_def::MouseButton;
 
     /// Whether the key is physically down right now (`GetAsyncKeyState`).
     pub fn is_key_pressed(vk: i32) -> bool {
-        let state = unsafe { GetAsyncKeyState(vk) };
-        (state as u16 & 0x8000) != 0
+        // Bit 15 of the i16 return is the "currently down" flag, i.e. the
+        // sign bit. Testing it directly avoids depending on an i16 -> u16
+        // cast preserving the pattern.
+        unsafe { GetAsyncKeyState(vk) < 0 }
     }
 
     /// Map a virtual-key code to its scancode; 0 when the VK has none.
+    ///
+    /// Uses the `_EX` mapping, which keeps the `0xE0` prefix in the high byte.
+    /// Without it the arrow cluster and the numpad collapse onto the same
+    /// scancodes (Up and numpad-8 are both `0x48`), and replay picks whichever
+    /// one the bare scancode happens to mean — a recorded Up arrow types an 8.
     pub fn vk_to_scancode(vk: i32) -> u16 {
-        unsafe { MapVirtualKeyA(vk as u32, MAP_VIRTUAL_KEY_TYPE(MAPVK_VK_TO_VSC.0)) as u16 }
+        unsafe { MapVirtualKeyA(vk as u32, MAP_VIRTUAL_KEY_TYPE(MAPVK_VK_TO_VSC_EX.0)) as u16 }
     }
 
     pub(super) fn keyboard_input(scancode: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
@@ -76,8 +103,15 @@ mod platform {
     /// Inject a key event globally; false when the OS refused the injection
     /// (UIPI, secure desktop).
     pub fn send_key(scancode: u16, up: bool) -> bool {
-        let flags = if up { KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP } else { KEYEVENTF_SCANCODE };
-        send(&[keyboard_input(scancode, flags)])
+        let (sc, extended) = super::split_scancode(scancode);
+        let mut flags = KEYEVENTF_SCANCODE;
+        if extended {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        if up {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        send(&[keyboard_input(sc, flags)])
     }
 
     /// Inject a mouse-button event globally; false when the OS refused it.
@@ -106,15 +140,35 @@ mod platform {
     /// Move the cursor to absolute pixel coordinates; false when refused or
     /// when the screen size cannot be queried.
     pub fn send_mouse_move(x: i32, y: i32) -> bool {
-        // Convert pixel coords to absolute (0..65535) normalized coords
-        let (sx, sy) = unsafe {
-            use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-            (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
+        // Coordinates come from GetCursorPos, which reports virtual-desktop
+        // space: a monitor left of the primary yields negative x. Normalizing
+        // those against SM_CXSCREEN (the primary alone) clamps every such
+        // click to the primary's edge, so use the virtual desktop's own origin
+        // and size, and tell SendInput to interpret them that way with
+        // MOUSEEVENTF_VIRTUALDESK. All three parts are required together.
+        let (ox, oy, sx, sy) = unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+                SM_YVIRTUALSCREEN,
+            };
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
         };
-        if sx == 0 || sy == 0 { return false; }
-        let abs_x = ((x as i64 * 65536) / sx as i64) as i32;
-        let abs_y = ((y as i64 * 65536) / sy as i64) as i32;
-        send(&[mouse_input(abs_x, abs_y, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)])
+        if sx <= 1 || sy <= 1 { return false; }
+        // Microsoft's documented normalization is 65535 / (extent - 1); using
+        // 65536 / extent leaves the last row and column unreachable.
+        let abs_x = (((x - ox) as i64 * 65535) / (sx - 1) as i64).clamp(0, 65535) as i32;
+        let abs_y = (((y - oy) as i64 * 65535) / (sy - 1) as i64).clamp(0, 65535) as i32;
+        send(&[mouse_input(
+            abs_x,
+            abs_y,
+            0,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+        )])
     }
 
     /// The cursor's screen position, or `None` when the query fails (e.g.
@@ -252,17 +306,24 @@ mod platform {
         use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
         use windows::Win32::Foundation::{WPARAM, LPARAM};
 
-        use windows::Win32::UI::Input::KeyboardAndMouse::MAPVK_VSC_TO_VK;
+        use windows::Win32::UI::Input::KeyboardAndMouse::MAPVK_VSC_TO_VK_EX;
         use windows::Win32::UI::WindowsAndMessaging::{WM_KEYDOWN, WM_KEYUP};
 
+        let (sc, extended) = super::split_scancode(scancode);
         unsafe {
-            let vk = MapVirtualKeyA(scancode as u32, MAP_VIRTUAL_KEY_TYPE(MAPVK_VSC_TO_VK.0)) as usize;
-            // lParam: repeat count 1, scancode, and for key-up the
-            // previous-state and transition bits (30 and 31).
+            // MAPVK_VSC_TO_VK_EX resolves the prefixed form, so an extended
+            // scancode maps to VK_UP rather than to its numpad twin.
+            let lookup = if extended { super::EXTENDED_PREFIX | sc } else { sc };
+            let vk =
+                MapVirtualKeyA(lookup as u32, MAP_VIRTUAL_KEY_TYPE(MAPVK_VSC_TO_VK_EX.0)) as usize;
+            // lParam: repeat count 1, scancode, bit 24 for an extended key,
+            // and for key-up the previous-state and transition bits (30, 31).
+            let extended_bit = if extended { 1u32 << 24 } else { 0 };
+            let base = 1u32 | ((sc as u32) << 16) | extended_bit;
             let (msg, lparam) = if up {
-                (WM_KEYUP, 1u32 | ((scancode as u32) << 16) | 0xC000_0000)
+                (WM_KEYUP, base | 0xC000_0000)
             } else {
-                (WM_KEYDOWN, 1u32 | ((scancode as u32) << 16))
+                (WM_KEYDOWN, base)
             };
             PostMessageW(Some(hwnd), msg, WPARAM(vk), LPARAM(lparam as isize)).is_ok()
         }
@@ -357,8 +418,11 @@ mod platform {
                 return true;
             }
             let mut title_buf = vec![0u16; (len + 1) as usize];
-            unsafe { GetWindowTextW(hwnd, &mut title_buf) };
-            let title = String::from_utf16_lossy(&title_buf[..len as usize]);
+            // Cut with what GetWindowTextW actually wrote, not the earlier
+            // length: a title that changes between the two calls otherwise
+            // leaves padding zeros inside the string.
+            let written = unsafe { GetWindowTextW(hwnd, &mut title_buf) };
+            let title = String::from_utf16_lossy(&title_buf[..written.max(0) as usize]);
             if !title.is_empty() {
                 list.push((exe_name.to_string(), title));
             }
@@ -468,11 +532,17 @@ mod scroll_hook {
 
     /// Install the low-level scroll hook on its own message-pump thread.
     ///
-    /// Blocks until the thread has a message queue and has published its id:
-    /// a `stop()` racing the spawn would otherwise find no target, leaking
-    /// the hook and its thread for the rest of the process.
+    /// Blocks until the hook is installed and the thread id published: a
+    /// `stop()` racing the spawn would otherwise find no target, leaking the
+    /// hook and its thread for the rest of the process. Calling `start` twice
+    /// is safe; the previous hook is torn down first.
     pub fn start(tx: mpsc::Sender<AppEvent>) {
         use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_NOREMOVE};
+
+        // Idempotent: a second start without a stop would strand the first
+        // thread with its hook installed for the rest of the process, and each
+        // orphaned WH_MOUSE_LL taxes every mouse event system-wide.
+        stop();
 
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let spawned = std::thread::Builder::new()
@@ -489,14 +559,22 @@ mod scroll_hook {
                     let mut msg = std::mem::zeroed();
                     let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
                     let tid = windows::Win32::System::Threading::GetCurrentThreadId();
-                    HOOK_THREAD_ID.store(tid as isize, Ordering::SeqCst);
+
+                    let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0);
+
+                    // Publish the id only once the hook is installed, and only
+                    // on success. Releasing the caller earlier leaves a window
+                    // where stop() posts WM_QUIT to a thread that has not yet
+                    // installed its hook, and storing 0 on the failure path
+                    // could clear an id a newer thread had already claimed.
+                    if hook.is_ok() {
+                        HOOK_THREAD_ID.store(tid as isize, Ordering::SeqCst);
+                    }
                     let _ = ready_tx.send(());
 
-                    let Ok(hook) = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0)
-                    else {
+                    let Ok(hook) = hook else {
                         // A panic here would only kill this detached thread,
                         // silently losing scroll capture for the recording.
-                        HOOK_THREAD_ID.store(0, Ordering::SeqCst);
                         let _ = warn_tx.send(AppEvent::Warning(
                             "Scroll capture unavailable: mouse hook failed".into(),
                         ));
@@ -758,6 +836,23 @@ mod tests {
         let mut target = WindowTarget::default();
         target.invalidate();
         assert!(target.hwnd.is_none());
+    }
+
+    #[test]
+    fn split_scancode_separates_the_extended_prefix() {
+        assert_eq!(split_scancode(0x1E), (0x1E, false), "plain A");
+        assert_eq!(split_scancode(0xE048), (0x48, true), "arrow up");
+        assert_eq!(split_scancode(0x48), (0x48, false), "numpad 8");
+    }
+
+    #[test]
+    fn extended_and_numpad_twins_stay_distinguishable() {
+        // The whole point of keeping the prefix: these two share a low byte
+        // and must not collapse onto one another.
+        let (up, up_ext) = split_scancode(0xE048);
+        let (num8, num8_ext) = split_scancode(0x48);
+        assert_eq!(up, num8);
+        assert!(up_ext && !num8_ext);
     }
 
     #[test]
